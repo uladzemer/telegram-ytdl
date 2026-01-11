@@ -69,6 +69,7 @@ bot.on("message:document", async (ctx) => {
 	const processing = await ctx.reply("Updating cookies...")
 	try {
 		const file = await ctx.api.getFile(doc.file_id)
+		console.log("File path from API:", file.file_path)
 		
 		// In local mode with mounted volumes, getFile returns the absolute path on disk.
 		// Since we mounted the same volume to the same path, we can read it directly.
@@ -77,7 +78,8 @@ bot.on("message:document", async (ctx) => {
 		
 		await ctx.reply(`Cookies updated successfully!\nLocation: ${COOKIE_FILE}`)
 	} catch (error) {
-		await ctx.reply(`Error updating cookies: ${error instanceof Error ? error.message : "Unknown"}`)
+		console.error(error)
+		await ctx.reply(`DEBUG ERROR: ${error instanceof Error ? error.message : "Unknown"}`)
 	} finally {
 		await deleteMessage(processing)
 	}

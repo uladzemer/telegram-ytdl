@@ -87,8 +87,6 @@ bot.on("message:document", async (ctx) => {
 
 //? filter out messages from non-whitelisted users
 bot.on("message:text", async (ctx, next) => {
-//? filter out messages from non-whitelisted users
-bot.on("message:text", async (ctx, next) => {
 	if (WHITELISTED_IDS.length === 0) return await next()
 	if (WHITELISTED_IDS.includes(ctx.from?.id)) return await next()
 

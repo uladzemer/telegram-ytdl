@@ -71,7 +71,7 @@ const downloadAndSend = async (
 		}
 
 		if (quality !== "audio") {
-			formatArgs.push("--merge-output-format", "mp4")
+			formatArgs.push("--recode-video", "mp4")
 		}
 
 		const info = await safeGetInfo(url, [
@@ -84,7 +84,7 @@ const downloadAndSend = async (
 		])
 
 		const title = removeHashtagsMentions(info.title)
-		const caption = `${title}\n\n${link("Original Link", url)}`
+		const caption = link(title || "Video", url)
 
 		if (quality === "audio") {
 			const stream = downloadFromInfo(info, "-", formatArgs)

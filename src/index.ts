@@ -20,6 +20,22 @@ import { bot } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions } from "./util"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
+const execFilePromise = promisify(execFile)
+
+const safeGetInfo = async (url: string, args: string[]) => {
+	const { stdout } = await execFilePromise("yt-dlp", [url, ...args])
+	// Split by newline and try to parse the first valid JSON line
+	const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
+	for (const line of lines) {
+		try {
+			return JSON.parse(line)
+		} catch {}
+	}
+	throw new Error("No valid JSON found in yt-dlp output")
+}
 
 const queue = new Queue()
 const updater = new Updater()
@@ -170,7 +186,8 @@ bot.command("formats", async (ctx) => {
 				const additionalArgs = isTiktok ? tiktokArgs : []
 				const formatArgs = ["-f", requestedFormat]
 
-				const info = await getInfo(url, [
+				const info = await safeGetInfo(url, [
+					"--dump-json",
 					...formatArgs,
 					"--no-warnings",
 					"--no-playlist",
@@ -198,7 +215,7 @@ bot.command("formats", async (ctx) => {
 
 	const processing = await ctx.reply("Fetching formats...")
 	try {
-		const info = await getInfo(url, ["--no-warnings", "--no-playlist", ...(await cookieArgs())])
+		const info = await safeGetInfo(url, ["--dump-json", "--no-warnings", "--no-playlist", ...(await cookieArgs())])
 
 		if (!info.formats || info.formats.length === 0) {
 			await ctx.reply("No formats found.")
@@ -318,7 +335,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 
 		// Check available formats
-		const info = await getInfo(url.text, [
+		const info = await safeGetInfo(url.text, [
 			"--dump-json",
 			"--no-warnings",
 			"-q",
@@ -422,7 +439,8 @@ bot.on("callback_query:data", async (ctx) => {
 			// However, for "b" (Best), we prefer direct URL if possible.
 			// For others, we might need piping.
 
-			const info = await getInfo(url, [
+			const info = await safeGetInfo(url, [
+				"--dump-json",
 				...formatArgs,
 				"--no-warnings",
 				"--no-playlist",

@@ -321,6 +321,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const info = await getInfo(url.text, [
 			"--dump-json",
 			"--no-warnings",
+			"-q",
+			"--no-progress",
 			"--no-playlist",
 			...(await cookieArgs()),
 			...additionalArgs,

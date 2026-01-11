@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto"
 import { downloadFromInfo, getInfo } from "@resync-tv/yt-dlp"
-import { InputFile } from "grammy"
+import { InlineKeyboard, InputFile } from "grammy"
 import { deleteMessage, errorMessage } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
 import { link, t, tiktokArgs } from "./constants"
@@ -18,6 +19,7 @@ import { chunkArray, removeHashtagsMentions } from "./util"
 
 const queue = new Queue()
 const updater = new Updater()
+const requestCache = new Map<string, string>()
 
 bot.use(async (ctx, next) => {
 	if (ctx.chat?.type === "private") {
@@ -78,6 +80,99 @@ bot.on("message:text", async (ctx, next) => {
 	await next()
 })
 
+bot.command("formats", async (ctx) => {
+	const args = ctx.match?.split(/\s+/)
+	const url = args?.[0]
+	const requestedFormat = args?.[1]
+
+	if (!url) {
+		return ctx.reply("Usage: /formats <url> [format_id]\nExample: /formats <url> 137+140")
+	}
+
+	if (requestedFormat) {
+		const processing = await ctx.reply(`Queuing download for format: ${requestedFormat}...`)
+		queue.add(async () => {
+			try {
+				const isTiktok = urlMatcher(url, "tiktok.com")
+				const additionalArgs = isTiktok ? tiktokArgs : []
+				const formatArgs = ["-f", requestedFormat]
+
+				const info = await getInfo(url, [
+					...formatArgs,
+					"--no-playlist",
+					...(await cookieArgs()),
+					...additionalArgs,
+				])
+
+				const title = removeHashtagsMentions(info.title)
+				const stream = downloadFromInfo(info, "-", formatArgs)
+				const video = new InputFile(stream.stdout, title)
+
+				await ctx.replyWithVideo(video, {
+					caption: `${title} [${requestedFormat}]`,
+					supports_streaming: true,
+					duration: info.duration,
+				})
+			} catch (error) {
+				await ctx.reply(`Download Error: ${error instanceof Error ? error.message : "Unknown"}`)
+			} finally {
+				await deleteMessage(processing)
+			}
+		})
+		return
+	}
+
+	const processing = await ctx.reply("Fetching formats...")
+	try {
+		const info = await getInfo(url, ["--no-playlist", ...(await cookieArgs())])
+			await ctx.reply("No formats found.")
+			return
+		}
+
+		// Header
+		let output =
+			"ID | EXT | RES | FPS | SIZE | VCODEC | ACODEC\n" +
+			"---|-----|-----|-----|------|--------|-------\n"
+
+		// Rows
+		for (const f of info.formats) {
+			const filesize = f.filesize
+				? `${(f.filesize / 1024 / 1024).toFixed(1)}MiB`
+				: f.filesize_approx
+					? `~${(f.filesize_approx / 1024 / 1024).toFixed(1)}MiB`
+					: "N/A"
+
+			const vcodec =
+				f.vcodec && f.vcodec !== "none"
+					? f.vcodec.split(".")[0]
+					: f.acodec !== "none"
+						? "audio"
+						: "none"
+
+			const acodec =
+				f.acodec && f.acodec !== "none" ? f.acodec.split(".")[0] : "none"
+
+			const fps = f.fps ? f.fps : ""
+			const res = f.resolution || (f.width ? `${f.width}x${f.height}` : "audio")
+
+			output += `${f.format_id} | ${f.ext} | ${res} | ${fps} | ${filesize} | ${vcodec} | ${acodec}\n`
+		}
+
+		if (output.length > 4000) {
+			const buffer = Buffer.from(output, "utf-8")
+			await ctx.replyWithDocument(new InputFile(buffer, "formats.txt"), {
+				caption: `Available formats for: ${info.title}`,
+			})
+		} else {
+			await ctx.replyWithHTML(`<pre>${output}</pre>`)
+		}
+	} catch (error) {
+		await ctx.reply(`Error: ${error instanceof Error ? error.message : "Unknown"}`)
+	} finally {
+		await deleteMessage(processing)
+	}
+})
+
 bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
@@ -133,57 +228,139 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 	}
 
+	// Move queue logic to callback, here only prepare options
+	try {
+		const isTiktok = urlMatcher(url.text, "tiktok.com")
+		const useCobalt = cobaltMatcher(url.text)
+		const additionalArgs = isTiktok ? tiktokArgs : []
+
+		if (useCobalt) {
+			if (await useCobaltResolver()) {
+				await deleteMessage(processingMessage)
+				return
+			}
+		}
+
+		// Check available formats
+		const info = await getInfo(url.text, [
+			"--dump-json",
+			"--no-playlist",
+			...(await cookieArgs()),
+			...additionalArgs,
+		])
+
+		const requestId = randomUUID().split("-")[0]
+		requestCache.set(requestId, url.text)
+		// Expire cache after 1 hour
+		setTimeout(() => requestCache.delete(requestId), 3600000)
+
+		const formats = info.formats || []
+		const availableHeights = new Set(
+			formats.map((f: any) => f.height).filter((h: any) => typeof h === "number"),
+		)
+
+		const keyboard = new InlineKeyboard()
+		keyboard.text("Best (Default)", `d:${requestId}:b`).row()
+
+		if (availableHeights.has(2160))
+			keyboard.text("4K (2160p)", `d:${requestId}:2160`).row()
+		if (availableHeights.has(1440))
+			keyboard.text("2K (1440p)", `d:${requestId}:1440`).row()
+		if (availableHeights.has(1080))
+			keyboard.text("1080p", `d:${requestId}:1080`).row()
+		if (availableHeights.has(720))
+			keyboard.text("720p", `d:${requestId}:720`).row()
+		if (availableHeights.has(480))
+			keyboard.text("480p", `d:${requestId}:480`).row()
+
+		keyboard.text("Audio (MP3)", `d:${requestId}:audio`).row()
+		keyboard.text("Cancel", `d:${requestId}:cancel`)
+
+		await ctx.reply(`Select quality for: ${removeHashtagsMentions(info.title)}`, {
+			reply_markup: keyboard,
+			reply_to_message_id: ctx.message.message_id,
+		})
+	} catch (error) {
+		if (await useCobaltResolver()) {
+			await deleteMessage(processingMessage)
+			return
+		}
+		const msg =
+			error instanceof Error
+				? errorMessage(ctx.chat, error.message)
+				: errorMessage(ctx.chat, `Couldn't process ${url}`)
+		await msg
+	} finally {
+		await deleteMessage(processingMessage)
+	}
+})
+
+bot.on("callback_query:data", async (ctx) => {
+	const data = ctx.callbackQuery.data
+	if (!data.startsWith("d:")) return await ctx.answerCallbackQuery()
+
+	const [, requestId, quality] = data.split(":")
+	const url = requestCache.get(requestId)
+
+	if (!url) {
+		await ctx.answerCallbackQuery({
+			text: "Request expired or invalid.",
+			show_alert: true,
+		})
+		return await ctx.deleteMessage()
+	}
+
+	if (quality === "cancel") {
+		requestCache.delete(requestId)
+		await ctx.answerCallbackQuery({ text: "Cancelled" })
+		return await ctx.deleteMessage()
+	}
+
+	await ctx.answerCallbackQuery({ text: "Queued for download..." })
+	await ctx.editMessageText(`Downloading ${quality === "b" ? "Best" : quality}...`)
+
 	queue.add(async () => {
 		try {
-			const isTiktok = urlMatcher(url.text, "tiktok.com")
-			const isYouTubeMusic = urlMatcher(url.text, "music.youtube.com")
-			const useCobalt = cobaltMatcher(url.text)
+			const isTiktok = urlMatcher(url, "tiktok.com")
+			const isYouTubeMusic = urlMatcher(url, "music.youtube.com")
 			const additionalArgs = isTiktok ? tiktokArgs : []
 
-			if (useCobalt) {
-				if (await useCobaltResolver()) return
+			let formatArgs: string[] = []
+			if (quality === "audio") {
+				formatArgs = ["-x", "--audio-format", "mp3"]
+			} else if (quality === "b") {
+				formatArgs = ["-f", "b"]
+			} else {
+				// Specific video quality
+				formatArgs = [
+					"-f",
+					`bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]`,
+				]
 			}
 
-			// -----------------------------------------------------------------------------
+			// We need to fetch info again to get the download URL or verify formats for the specific quality
+			// OR we can trust yt-dlp to handle the passed args.
+			// However, for "b" (Best), we prefer direct URL if possible.
+			// For others, we might need piping.
 
-			const info = await getInfo(url.text, [
-				"-f",
-				"b",
+			const info = await getInfo(url, [
+				...formatArgs,
 				"--no-playlist",
 				...(await cookieArgs()),
 				...additionalArgs,
 			])
 
-			const [download] = info.requested_downloads ?? []
-			if (!download || !download.url) throw new Error("No download available")
-
 			const title = removeHashtagsMentions(info.title)
+			const [download] = info.requested_downloads ?? []
 
-			if (download.vcodec !== "none" && !isYouTubeMusic) {
-				let video: InputFile | string
+			// If specific quality requested (not 'b' and not 'audio'), usually implies merged formats -> use pipe
+			// If 'b', check if direct URL is available.
+			const usePipe =
+				quality !== "b" && quality !== "audio" && !isTiktok && !isYouTubeMusic
 
-				if (isTiktok) {
-					const stream = downloadFromInfo(info, "-")
-					video = new InputFile(stream.stdout, title)
-				} else {
-					video = new InputFile({ url: download.url }, title)
-				}
-
-				await ctx.replyWithVideo(video, {
-					caption: title,
-					supports_streaming: true,
-					duration: info.duration,
-					reply_parameters: {
-						message_id: ctx.message?.message_id,
-						allow_sending_without_reply: true,
-					},
-				})
-			} else if (download.acodec !== "none") {
-				const stream = downloadFromInfo(info, "-", [
-					"-x",
-					"--audio-format",
-					"mp3",
-				])
+			if (quality === "audio") {
+				// Audio download
+				const stream = downloadFromInfo(info, "-", formatArgs)
 				const audio = new InputFile(stream.stdout)
 
 				await ctx.replyWithAudio(audio, {
@@ -192,22 +369,33 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					title: info.title,
 					thumbnail: getThumbnail(info.thumbnails),
 					duration: info.duration,
-					reply_parameters: {
-						message_id: ctx.message?.message_id,
-						allow_sending_without_reply: true,
-					},
 				})
 			} else {
-				if (await useCobaltResolver()) return
-				throw new Error("No download available")
+				// Video download
+				let video: InputFile | string
+
+				if (usePipe || isTiktok) {
+					// Use pipe for forced quality or tiktok
+					const stream = downloadFromInfo(info, "-", formatArgs)
+					video = new InputFile(stream.stdout, title)
+				} else {
+					// Try direct URL for 'b'
+					if (!download || !download.url) throw new Error("No download available")
+					video = new InputFile({ url: download.url }, title)
+				}
+
+				await ctx.replyWithVideo(video, {
+					caption: title,
+					supports_streaming: true,
+					duration: info.duration,
+				})
 			}
+
+			await ctx.deleteMessage() // Delete the "Downloading..." status message
 		} catch (error) {
-			if (await useCobaltResolver()) return
-			return error instanceof Error
-				? errorMessage(ctx.chat, error.message)
-				: errorMessage(ctx.chat, `Couldn't download ${url}`)
-		} finally {
-			await deleteMessage(processingMessage)
+			await ctx.editMessageText(
+				`Error: ${error instanceof Error ? error.message : "Unknown error"}`,
+			)
 		}
 	})
 })

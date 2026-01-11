@@ -23,6 +23,9 @@ if (WEBHOOK_URL) {
 	console.log(`Starting bot with root ${API_ROOT}...`)
 	server.listen(WEBHOOK_PORT, async () => {
 		await bot.api.setWebhook(WEBHOOK_URL)
+		await bot.api.setMyCommands([
+			{ command: "formats", description: "Check available formats" },
+		])
 		console.log(`Webhook set to ${WEBHOOK_URL}`)
 
 		const me = await bot.api.getMe()
@@ -31,7 +34,10 @@ if (WEBHOOK_URL) {
 } else {
 	console.log(`Starting bot in POLLING mode with root ${API_ROOT}...`)
 	bot.start({
-		onStart: (me) => {
+		onStart: async (me) => {
+			await bot.api.setMyCommands([
+				{ command: "formats", description: "Check available formats" },
+			])
 			console.log(`Bot started as @${me.username} (Polling)`)
 		},
 	})

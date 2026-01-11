@@ -125,6 +125,8 @@ bot.command("formats", async (ctx) => {
 	const processing = await ctx.reply("Fetching formats...")
 	try {
 		const info = await getInfo(url, ["--no-playlist", ...(await cookieArgs())])
+
+		if (!info.formats || info.formats.length === 0) {
 			await ctx.reply("No formats found.")
 			return
 		}

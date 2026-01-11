@@ -184,9 +184,9 @@ bot.command("formats", async (ctx) => {
 			try {
 				const isTiktok = urlMatcher(url, "tiktok.com")
 				const additionalArgs = isTiktok ? tiktokArgs : []
-				const formatArgs = ["-f", requestedFormat]
+				const formatArgs = ["-f", requestedFormat, "--merge-output-format", "mp4"]
 
-				const info = await safeGetInfo(url, [
+				const info = await getInfo(url, [
 					"--dump-json",
 					...formatArgs,
 					"--no-warnings",
@@ -425,12 +425,12 @@ bot.on("callback_query:data", async (ctx) => {
 			if (quality === "audio") {
 				formatArgs = ["-x", "--audio-format", "mp3"]
 			} else if (quality === "b") {
-				formatArgs = ["-f", "b"]
+				formatArgs = ["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"]
 			} else {
 				// Specific video quality
 				formatArgs = [
 					"-f",
-					`bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]`,
+					`bestvideo[height<=${quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
 				]
 			}
 

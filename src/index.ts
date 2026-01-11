@@ -121,6 +121,8 @@ const downloadAndSend = async (
 				parse_mode: "HTML",
 				supports_streaming: true,
 				duration: info.duration,
+				width: info.width,
+				height: info.height,
 			})
 		}
 	} catch (error) {

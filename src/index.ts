@@ -8,6 +8,7 @@ import { link, t, tiktokArgs } from "./constants"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
+	API_ROOT,
 	COOKIE_FILE,
 	cookieArgs,
 	WHITELISTED_IDS,
@@ -78,7 +79,7 @@ bot.on("message:document", async (ctx) => {
 		// BUT, the local API server usually ALSO serves the file via HTTP if requested.
 		// Let's try fetching from the API_ROOT/file/bot<token>/<file_path>
 		
-		const downloadUrl = `${bot.api.config.client?.apiRoot}/file/bot${bot.token}/${file.file_path}`
+		const downloadUrl = `${API_ROOT}/file/bot${bot.token}/${file.file_path}`
 		const response = await fetch(downloadUrl)
 		if (!response.ok) throw new Error("Failed to download file from API server")
 		

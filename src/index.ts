@@ -73,6 +73,7 @@ const downloadAndSend = async (
 
 		if (quality !== "audio") {
 			formatArgs.push("--recode-video", "mp4")
+			formatArgs.push("--postprocessor-args", "VideoConvertor:-vf setsar=1")
 		}
 
 		const info = await safeGetInfo(url, [

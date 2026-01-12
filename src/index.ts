@@ -111,6 +111,7 @@ const downloadAndSend = async (
 	isRawFormat = false,
 	statusMessageId?: number,
 	overrideTitle?: string,
+	replyToMessageId?: number,
 ) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
 	const tempThumbPath = resolve("/tmp", `${randomUUID()}.jpg`)
@@ -189,6 +190,7 @@ const downloadAndSend = async (
 				title: info.title,
 				thumbnail: getThumbnail(info.thumbnails),
 				duration: info.duration,
+				reply_to_message_id: replyToMessageId,
 			})
 			if (statusMessageId) {
 				try {
@@ -261,6 +263,7 @@ const downloadAndSend = async (
 				width,
 				height,
 				thumbnail: thumbFile,
+				reply_to_message_id: replyToMessageId,
 			})
 
 			if (statusMessageId) {
@@ -434,6 +437,8 @@ bot.command("formats", async (ctx) => {
 				requestedFormat,
 				true,
 				processing.message_id,
+				undefined,
+				ctx.message.message_id,
 			)
 		})
 		return
@@ -496,15 +501,19 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
 
-		const isTiktok = urlMatcher(url.text, "tiktok.com")
+	const isPrivate = ctx.chat.type === "private"
+	let processingMessage: any
 
-	const processingMessage = await ctx.replyWithHTML(t.processing, {
-		disable_notification: true,
-	})
+	if (isPrivate) {
+		processingMessage = await ctx.replyWithHTML(t.processing, {
+			disable_notification: true,
+			reply_to_message_id: ctx.message.message_id,
+		})
+	}
 
 	let autoDeleteProcessingMessage = true
 
-	if (ctx.chat.id !== ADMIN_ID) {
+	if (isPrivate && ctx.chat.id !== ADMIN_ID) {
 		ctx
 			.forwardMessage(ADMIN_ID, { disable_notification: true })
 			.then(async (forwarded) => {
@@ -536,14 +545,18 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				)
 
 				for (const chunk of photos) {
-					await bot.api.sendMediaGroup(ctx.chat.id, chunk)
+					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
+						reply_to_message_id: ctx.message.message_id,
+					})
 				}
 
 				return true
 			}
 
 			if (resolved.status === "redirect") {
-				await ctx.replyWithHTML(link("Resolved content URL", resolved.url))
+				await ctx.replyWithHTML(link("Resolved content URL", resolved.url), {
+					reply_to_message_id: ctx.message.message_id,
+				})
 				return true
 			}
 		} catch (error) {
@@ -602,7 +615,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 		const title = bypassTitle || removeHashtagsMentions(info.title)
 
-		if (ALWAYS_DOWNLOAD_BEST) {
+		// If group chat OR always download best is enabled -> Auto download
+		if (!isPrivate || ALWAYS_DOWNLOAD_BEST) {
 			autoDeleteProcessingMessage = false
 			queue.add(async () => {
 				await downloadAndSend(
@@ -610,8 +624,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					url.text,
 					"b",
 					false,
-					processingMessage.message_id,
+					processingMessage?.message_id,
 					title,
+					ctx.message.message_id,
 				)
 			})
 			return
@@ -652,13 +667,19 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		if (await useCobaltResolver()) {
 			return
 		}
-		const msg =
-			error instanceof Error
-				? errorMessage(ctx.chat, error.message)
-				: errorMessage(ctx.chat, `Couldn't process ${url.text}`)
-		await msg
+		
+		// Only send errors in private chats to avoid spamming groups
+		if (isPrivate) {
+			const msg =
+				error instanceof Error
+					? errorMessage(ctx.chat, error.message)
+					: errorMessage(ctx.chat, `Couldn't process ${url.text}`)
+			await msg
+		} else {
+			console.error(`Group silent fail for ${url.text}:`, error)
+		}
 	} finally {
-		if (autoDeleteProcessingMessage) {
+		if (autoDeleteProcessingMessage && processingMessage) {
 			try {
 				await deleteMessage(processingMessage)
 			} catch {}
@@ -702,6 +723,7 @@ bot.on("callback_query:data", async (ctx) => {
 			false,
 			ctx.callbackQuery.message?.message_id,
 			title,
+			ctx.callbackQuery.message?.reply_to_message?.message_id,
 		)
 	})
 })

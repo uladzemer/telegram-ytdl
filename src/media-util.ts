@@ -1,9 +1,63 @@
 import type { ytDlpInfo } from "@resync-tv/yt-dlp"
 import { InputFile } from "grammy"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
+
+const execFilePromise = promisify(execFile)
 
 export const urlMatcher = (url: string, matcher: string) => {
 	const parsed = new URL(url)
 	return parsed.hostname.endsWith(matcher)
+}
+
+export const getVideoMetadata = async (filePath: string) => {
+	try {
+		const { stdout } = await execFilePromise("ffprobe", [
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-show_entries",
+			"stream=width,height,duration",
+			"-of",
+			"json",
+			filePath,
+		])
+		const data = JSON.parse(stdout)
+		const stream = data.streams?.[0]
+		return {
+			width: stream?.width ? Number(stream.width) : undefined,
+			height: stream?.height ? Number(stream.height) : undefined,
+			duration: stream?.duration ? Math.ceil(Number(stream.duration)) : undefined,
+		}
+	} catch (e) {
+		console.error("ffprobe error:", e)
+		return {}
+	}
+}
+
+export const generateThumbnail = async (videoPath: string, thumbnailPath: string) => {
+	try {
+		// Extract a frame at 00:00:01, scale to max 320px width/height while keeping aspect ratio
+		await execFilePromise("ffmpeg", [
+			"-y",
+			"-i",
+			videoPath,
+			"-ss",
+			"00:00:01",
+			"-vframes",
+			"1",
+			"-vf",
+			"scale='min(320,iw)':-1",
+			"-q:v",
+			"2",
+			thumbnailPath,
+		])
+		return thumbnailPath
+	} catch (e) {
+		console.error("ffmpeg thumbnail generation error:", e)
+		return undefined
+	}
 }
 
 /**

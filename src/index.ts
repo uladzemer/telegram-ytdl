@@ -15,7 +15,7 @@ import {
 	cookieArgs,
 	WHITELISTED_IDS,
 } from "./environment"
-import { getThumbnail, urlMatcher } from "./media-util"
+import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
 import { Queue } from "./queue"
 import { bot } from "./setup"
 import { translateText } from "./translate"
@@ -113,6 +113,7 @@ const downloadAndSend = async (
 	overrideTitle?: string,
 ) => {
 	const tempFilePath = resolve("/tmp", `${randomUUID()}.mp4`)
+	const tempThumbPath = resolve("/tmp", `${randomUUID()}.jpg`)
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -231,6 +232,16 @@ const downloadAndSend = async (
 				onProgress,
 			)
 
+			// Get metadata directly from the file
+			const metadata = await getVideoMetadata(tempFilePath)
+			const width = metadata.width || info.width
+			const height = metadata.height || info.height
+			const duration = metadata.duration || info.duration
+
+			// Generate local thumbnail to ensure correct aspect ratio in Telegram
+			await generateThumbnail(tempFilePath, tempThumbPath)
+			const thumbFile = new InputFile(tempThumbPath)
+
 			const video = new InputFile(tempFilePath)
 
 			if (statusMessageId) {
@@ -246,10 +257,10 @@ const downloadAndSend = async (
 				caption,
 				parse_mode: "HTML",
 				supports_streaming: true,
-				duration: info.duration,
-				width: info.width,
-				height: info.height,
-				thumbnail: getThumbnail(info.thumbnails),
+				duration,
+				width,
+				height,
+				thumbnail: thumbFile,
 			})
 
 			if (statusMessageId) {
@@ -270,6 +281,7 @@ const downloadAndSend = async (
 	} finally {
 		try {
 			await unlink(tempFilePath)
+			await unlink(tempThumbPath)
 		} catch {}
 	}
 }

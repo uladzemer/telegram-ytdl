@@ -510,6 +510,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const [url] = ctx.entities("url")
 	if (!url) return await next()
 
+	console.log(`[DEBUG] Msg from chat ${ctx.chat.id} (${ctx.chat.type}): ${url.text}`)
+
 	const isPrivate = ctx.chat.type === "private"
 	let processingMessage: any
 

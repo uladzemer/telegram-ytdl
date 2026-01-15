@@ -870,6 +870,9 @@ const downloadAndSend = async (
 		}
 
 		if (isAudioRequest) {
+			const downloadArgs = formatArgs.includes("--js-runtimes")
+				? formatArgs
+				: [...jsRuntimeArgs, ...formatArgs]
 			if (isMp3Format) {
 				tempFilePath = resolve(tempDir, "audio.mp3")
 			} else if (info.ext && info.ext !== "none") {
@@ -886,7 +889,7 @@ const downloadAndSend = async (
 				"yt-dlp",
 				[
 					url,
-					...formatArgs,
+					...downloadArgs,
 					"-o",
 					tempFilePath,
 					"--no-part",
@@ -930,6 +933,9 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		} else {
+			const downloadArgs = formatArgs.includes("--js-runtimes")
+				? formatArgs
+				: [...jsRuntimeArgs, ...formatArgs]
 			let progressText = "Скачиваем..."
 			let fileSize = ""
 			let lastProgressAt = Date.now()
@@ -996,7 +1002,7 @@ const downloadAndSend = async (
 					"yt-dlp",
 					[
 						url,
-						...formatArgs,
+						...downloadArgs,
 						"-o",
 						tempFilePath,
 						"--no-part",
@@ -1096,38 +1102,54 @@ const downloadAndSend = async (
 					message_thread_id: threadId,
 				})
 			} else {
-				// Get metadata directly from the file
-				const metadata = await getVideoMetadata(tempFilePath)
-				const width = metadata.width || info.width
-				const height = metadata.height || info.height
-				const duration = metadata.duration || info.duration
+				if (outputContainer !== "mp4") {
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+						)
+					}
+					await ctx.replyWithChatAction("upload_document")
+					await ctx.replyWithDocument(new InputFile(tempFilePath), {
+						caption,
+						parse_mode: "HTML",
+						message_thread_id: threadId,
+					})
+				} else {
+					// Get metadata directly from the file
+					const metadata = await getVideoMetadata(tempFilePath)
+					const width = metadata.width || info.width
+					const height = metadata.height || info.height
+					const duration = metadata.duration || info.duration
 
-				// Generate local thumbnail to ensure correct aspect ratio in Telegram
-				await generateThumbnail(tempFilePath, tempThumbPath)
-				const thumbFile = new InputFile(tempThumbPath)
+					// Generate local thumbnail to ensure correct aspect ratio in Telegram
+					await generateThumbnail(tempFilePath, tempThumbPath)
+					const thumbFile = new InputFile(tempThumbPath)
 
-				const video = new InputFile(tempFilePath)
+					const video = new InputFile(tempFilePath)
 
-				if (statusMessageId) {
-					await updateMessage(
-						ctx,
-						statusMessageId,
-						`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
-					)
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+						)
+					}
+
+					await ctx.replyWithChatAction("upload_video")
+					const supportsStreaming = outputContainer === "mp4" && !isTiktok
+					await ctx.replyWithVideo(video, {
+						caption,
+						parse_mode: "HTML",
+						supports_streaming: supportsStreaming,
+						duration,
+						width,
+						height,
+						thumbnail: thumbFile,
+						message_thread_id: threadId,
+					})
 				}
-
-				await ctx.replyWithChatAction("upload_video")
-				const supportsStreaming = outputContainer === "mp4" && !isTiktok
-				await ctx.replyWithVideo(video, {
-					caption,
-					parse_mode: "HTML",
-					supports_streaming: supportsStreaming,
-					duration,
-					width,
-					height,
-					thumbnail: thumbFile,
-					message_thread_id: threadId,
-				})
 			}
 
 			if (statusMessageId) {

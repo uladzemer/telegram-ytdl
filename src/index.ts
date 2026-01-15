@@ -19,6 +19,8 @@ import {
 	ALLOW_GROUPS,
 	ALWAYS_DOWNLOAD_BEST,
 	API_ROOT,
+	CLEANUP_INTERVAL_HOURS,
+	CLEANUP_MAX_AGE_HOURS,
 	COOKIE_FILE,
 	cookieArgs,
 	WHITELISTED_IDS,
@@ -30,6 +32,36 @@ import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions, cleanUrl } from "./util"
 import { execFile, spawn, type ExecFileOptions } from "node:child_process"
+
+const TEMP_PREFIX = "yakachokbot-"
+const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
+	? Math.max(1, CLEANUP_INTERVAL_HOURS)
+	: 6
+const cleanupMaxAgeHours = Number.isFinite(CLEANUP_MAX_AGE_HOURS)
+	? Math.max(1, CLEANUP_MAX_AGE_HOURS)
+	: 12
+
+const cleanupTempDirs = async () => {
+	const now = Date.now()
+	const maxAgeMs = cleanupMaxAgeHours * 60 * 60 * 1000
+	try {
+		const entries = await readdir("/tmp", { withFileTypes: true })
+		for (const entry of entries) {
+			if (!entry.isDirectory()) continue
+			if (!entry.name.startsWith(TEMP_PREFIX)) continue
+			const fullPath = resolve("/tmp", entry.name)
+			try {
+				const info = await stat(fullPath)
+				if (now - info.mtimeMs < maxAgeMs) continue
+				await rm(fullPath, { recursive: true, force: true })
+			} catch (error) {
+				console.error("Temp cleanup error:", error)
+			}
+		}
+	} catch (error) {
+		console.error("Temp cleanup error:", error)
+	}
+}
 
 const execFilePromise = (
 	command: string,
@@ -552,6 +584,14 @@ const scheduleRequestExpiry = (requestId: string) => {
 	}, 3600000)
 }
 const updater = new Updater()
+cleanupTempDirs().catch((error) =>
+	console.error("Temp cleanup error:", error),
+)
+setInterval(() => {
+	cleanupTempDirs().catch((error) =>
+		console.error("Temp cleanup error:", error),
+	)
+}, cleanupIntervalHours * 60 * 60 * 1000).unref()
 type RequestCacheEntry = {
 	url: string
 	sourceUrl?: string

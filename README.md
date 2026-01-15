@@ -39,6 +39,8 @@ docker compose up -d
 | `TELEGRAM_WEBHOOK_URL`  | URL вебхука (если используете вебхук)                                                                                      |
 | `YTDL_AUTOUPDATE`       | Автообновление yt-dlp (`"true"` или `"false"`, по умолчанию `"true"`)                                                      |
 | `OPENAI_API_KEY`        | Ключ OpenAI (опционально, авто‑переводы)                                                                                   |
+| `CLEANUP_INTERVAL_HOURS` | Интервал очистки временных файлов в /tmp (часы, по умолчанию 6)                                                            |
+| `CLEANUP_MAX_AGE_HOURS`  | Максимальный возраст временных файлов в /tmp (часы, по умолчанию 12)                                                       |
 
 ## Файлы и хранилище
 

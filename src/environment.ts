@@ -28,6 +28,12 @@ export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "true") !== "false"
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
 export const ALWAYS_DOWNLOAD_BEST = getVariable("ALWAYS_DOWNLOAD_BEST", "false") !== "false"
+export const CLEANUP_INTERVAL_HOURS = Number.parseInt(
+	getVariable("CLEANUP_INTERVAL_HOURS", "6"),
+)
+export const CLEANUP_MAX_AGE_HOURS = Number.parseInt(
+	getVariable("CLEANUP_MAX_AGE_HOURS", "12"),
+)
 
 export const COOKIE_FILE = resolve(__dirname, "../storage/cookies.txt")
 export const cookieArgs = async () => {

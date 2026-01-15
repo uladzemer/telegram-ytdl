@@ -989,11 +989,11 @@ const downloadAndSend = async (
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
-					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
 				]
 				fallbackFormatArgs = [
 					"-f",
-					"bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 				]
 			} else {
 				formatArgs = [
@@ -1005,11 +1005,11 @@ const downloadAndSend = async (
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
-					`best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+					`bestvideo[protocol=https][height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${quality}][ext=mp4]/best[protocol=https][height<=${quality}]`,
 				]
 				fallbackFormatArgs = [
 					"-f",
-					`bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
+					`best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${quality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${quality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${quality}][ext=mp4]/best[height<=${quality}]`,
 				]
 			} else {
 				formatArgs = [

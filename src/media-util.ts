@@ -4,6 +4,19 @@ import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 
 const execFilePromise = promisify(execFile)
+const FFPROBE_TIMEOUT_MS = 15000
+const FFMPEG_THUMB_TIMEOUT_MS = 30000
+
+const execWithTimeout = async (
+	command: string,
+	args: string[],
+	timeoutMs: number,
+) => {
+	return await execFilePromise(command, args, {
+		timeout: timeoutMs,
+		killSignal: "SIGKILL",
+	})
+}
 
 export const urlMatcher = (url: string, matcher: string) => {
 	const parsed = new URL(url)
@@ -12,7 +25,7 @@ export const urlMatcher = (url: string, matcher: string) => {
 
 export const getVideoMetadata = async (filePath: string) => {
 	try {
-		const { stdout } = await execFilePromise("ffprobe", [
+		const { stdout } = await execWithTimeout("ffprobe", [
 			"-v",
 			"error",
 			"-select_streams",
@@ -22,7 +35,7 @@ export const getVideoMetadata = async (filePath: string) => {
 			"-of",
 			"json",
 			filePath,
-		])
+		], FFPROBE_TIMEOUT_MS)
 		const data = JSON.parse(stdout)
 		const stream = data.streams?.[0]
 
@@ -48,7 +61,12 @@ export const getVideoMetadata = async (filePath: string) => {
 
 		return { width, height, duration }
 	} catch (e) {
-		console.error("ffprobe error:", e)
+		const error = e as Error & { code?: number; signal?: string }
+		const timeoutNote = error.signal === "SIGKILL" ? " (timeout)" : ""
+		console.error(
+			`ffprobe error${timeoutNote}:`,
+			{ filePath, code: error.code, signal: error.signal },
+		)
 		return {}
 	}
 }
@@ -56,7 +74,7 @@ export const getVideoMetadata = async (filePath: string) => {
 export const generateThumbnail = async (videoPath: string, thumbnailPath: string) => {
 	try {
 		// Extract a frame at 00:00:01, scale to max 320px width/height while keeping aspect ratio
-		await execFilePromise("ffmpeg", [
+		await execWithTimeout("ffmpeg", [
 			"-y",
 			"-i",
 			videoPath,
@@ -69,10 +87,15 @@ export const generateThumbnail = async (videoPath: string, thumbnailPath: string
 			"-q:v",
 			"2",
 			thumbnailPath,
-		])
+		], FFMPEG_THUMB_TIMEOUT_MS)
 		return thumbnailPath
 	} catch (e) {
-		console.error("ffmpeg thumbnail generation error:", e)
+		const error = e as Error & { code?: number; signal?: string }
+		const timeoutNote = error.signal === "SIGKILL" ? " (timeout)" : ""
+		console.error(
+			`ffmpeg thumbnail generation error${timeoutNote}:`,
+			{ videoPath, thumbnailPath, code: error.code, signal: error.signal },
+		)
 		return undefined
 	}
 }

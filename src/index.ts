@@ -110,6 +110,28 @@ const updateMessage = (() => {
 	}
 })()
 
+const sendStatusMessage = async (
+	ctx: any,
+	text: string,
+	replyToMessageId?: number,
+	threadId?: number,
+) => {
+	try {
+		return await ctx.reply(text, {
+			reply_to_message_id: replyToMessageId,
+			message_thread_id: threadId,
+		})
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error)
+		if (message.includes("message to be replied not found")) {
+			return await ctx.reply(text, {
+				message_thread_id: threadId,
+			})
+		}
+		throw error
+	}
+}
+
 const lastBotMenuMessages = new Map<string, number>()
 
 const getChatKey = (ctx: any) => {
@@ -155,9 +177,19 @@ const spawnPromise = (
 ) => {
 	return new Promise<void>((resolve, reject) => {
 		if (signal?.aborted) return reject(new Error("Cancelled"))
+		let stderrBuffer = ""
+		let stdoutBuffer = ""
 		const process = spawn(command, args)
-		process.stdout.on("data", (d) => onData?.(d.toString()))
-		process.stderr.on("data", (d) => onData?.(d.toString()))
+		process.stdout.on("data", (d) => {
+			const text = d.toString()
+			onData?.(text)
+			stdoutBuffer = (stdoutBuffer + text).slice(-4000)
+		})
+		process.stderr.on("data", (d) => {
+			const text = d.toString()
+			onData?.(text)
+			stderrBuffer = (stderrBuffer + text).slice(-4000)
+		})
 		const onAbort = () => {
 			process.kill()
 			reject(new Error("Cancelled"))
@@ -167,10 +199,64 @@ const spawnPromise = (
 			process.on("close", () => signal.removeEventListener("abort", onAbort))
 		}
 		process.on("close", (code) => {
-			if (code === 0) resolve()
-			else reject(new Error(`Process exited with code ${code}`))
+			if (code === 0) return resolve()
+			if (stderrBuffer.trim() || stdoutBuffer.trim()) {
+				console.error("[ERROR] Process failed", {
+					command,
+					args,
+					code,
+					stderrTail: stderrBuffer.trim(),
+					stdoutTail: stdoutBuffer.trim(),
+				})
+			}
+			const details = stderrBuffer.trim() || stdoutBuffer.trim()
+			reject(
+				new Error(
+					`Process exited with code ${code}${details ? `: ${details}` : ""}`,
+				),
+			)
 		})
 	})
+}
+
+const getFlatPlaylistEntries = async (
+	url: string,
+	args: string[],
+	signal?: AbortSignal,
+) => {
+	try {
+		const { stdout } = await execFilePromise(
+			"yt-dlp",
+			[
+				url,
+				"--flat-playlist",
+				"--dump-json",
+				"--no-warnings",
+				"-q",
+				"--no-progress",
+				...args,
+			],
+			{ signal },
+		)
+		const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
+		const entries: { url: string; title?: string }[] = []
+		for (const line of lines) {
+			try {
+				const data = JSON.parse(line)
+				if (data?._type === "playlist") continue
+				const entryUrl = data?.url || data?.webpage_url
+				if (!entryUrl) continue
+				entries.push({ url: entryUrl, title: data?.title })
+			} catch {}
+		}
+		return entries
+	} catch (error) {
+		console.warn("[WARN] Failed to get flat playlist entries", {
+			url: cleanUrl(url),
+			error: error instanceof Error ? error.message : String(error),
+		})
+		return []
+	}
 }
 
 const safeGetInfo = async (
@@ -995,6 +1081,7 @@ const downloadAndSend = async (
 	formatLabelTail?: string,
 	forceHls = false,
 	sourceUrl?: string,
+	skipPlaylist = false,
 ) => {
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
@@ -1008,10 +1095,57 @@ const downloadAndSend = async (
 		const isTiktok = urlMatcher(url, "tiktok.com")
 		const isInstagram =
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
+		const isErome = urlMatcher(url, "erome.com")
 		const additionalArgs = isTiktok ? tiktokArgs : []
+		const resumeArgs = isErome ? ["--no-continue"] : []
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+
+		if (isErome && !skipPlaylist) {
+			const entries = await getFlatPlaylistEntries(
+				url,
+				[
+					...cookieArgsList,
+					...additionalArgs,
+					...impersonateArgs,
+					...youtubeArgs,
+				],
+				signal,
+			)
+			if (entries.length > 1) {
+				if (statusMessageId) {
+					try {
+						await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
+					} catch {}
+				}
+				for (const [index, entry] of entries.entries()) {
+					if (signal?.aborted) return
+					const processing = await sendStatusMessage(
+						ctx,
+						`Скачиваем ${index + 1}/${entries.length}...`,
+						replyToMessageId,
+						threadId,
+					)
+					await downloadAndSend(
+						ctx,
+						entry.url,
+						quality,
+						isRawFormat,
+						processing.message_id,
+						entry.title || overrideTitle,
+						replyToMessageId,
+						signal,
+						forceAudio,
+						formatLabelTail,
+						forceHls,
+						sourceUrl || url,
+						true,
+					)
+				}
+				return
+			}
+		}
 
 		const isMp3Format = isRawFormat && quality === "mp3"
 		const isAudioRequest = quality === "audio" || isMp3Format || forceAudio
@@ -1079,6 +1213,7 @@ const downloadAndSend = async (
 				...formatArgs,
 				"--no-warnings",
 				"--no-playlist",
+				...resumeArgs,
 				...cookieArgsList,
 				...additionalArgs,
 				...impersonateArgs,
@@ -1465,6 +1600,7 @@ const downloadAndSend = async (
 					[
 						url,
 						...args,
+						...resumeArgs,
 						"-o",
 						tempFilePath,
 						"--no-part",
@@ -1716,7 +1852,16 @@ const downloadAndSend = async (
 
 					// Generate local thumbnail to ensure correct aspect ratio in Telegram
 					await generateThumbnail(tempFilePath, tempThumbPath)
-					const thumbFile = new InputFile(tempThumbPath)
+					const thumbFile = (await fileExists(tempThumbPath, 256))
+						? new InputFile(tempThumbPath)
+						: undefined
+					if (!thumbFile) {
+						console.warn("[WARN] Thumbnail not available, sending without it", {
+							url: cleanUrl(url),
+							title,
+							tempThumbPath,
+						})
+					}
 
 					const video = new InputFile(tempFilePath)
 

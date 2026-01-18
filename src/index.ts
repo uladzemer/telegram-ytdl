@@ -267,13 +267,17 @@ const getFlatPlaylistEntries = async (
 		)
 		const lines = stdout.split("\n").filter((l) => l.trim().length > 0)
 		const entries: { url: string; title?: string }[] = []
+		const seen = new Set<string>()
 		for (const line of lines) {
 			try {
 				const data = JSON.parse(line)
 				if (data?._type === "playlist") continue
-				const entryUrl = data?.url || data?.webpage_url
+				const entryUrl = data?.webpage_url || data?.url
 				if (!entryUrl) continue
-				entries.push({ url: entryUrl, title: data?.title })
+				const normalized = String(entryUrl).trim()
+				if (!normalized || seen.has(normalized)) continue
+				seen.add(normalized)
+				entries.push({ url: normalized, title: data?.title })
 			} catch {}
 		}
 		return entries

@@ -2319,18 +2319,17 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	const userId = ctx.from?.id
 	if (!userId) return
 	const lockResult = lockUserUrl(userId, sourceUrl)
-	if (!lockResult.ok) {
-		await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.", {
-			reply_to_message_id: ctx.message.message_id,
-			message_thread_id: threadId,
-		})
-		await deleteUserMessage(ctx)
-		return
-	}
+		if (!lockResult.ok) {
+			await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.", {
+				reply_to_message_id: ctx.message.message_id,
+				message_thread_id: threadId,
+			})
+			return
+		}
 	const lockId = lockResult.lockId
 	let keepLock = false
 	let lockTransferred = false
-	let deleteIncomingMessage = true
+		let deleteIncomingMessage = false
 
 	if (isPrivate) {
 		processingMessage = await ctx.replyWithHTML(t.processing, {

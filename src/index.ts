@@ -11,6 +11,7 @@ import {
 import { dirname, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
+import { cookieFormatExample, mergeCookieContent } from "./cookies"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
 import { bold, code, link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
@@ -92,11 +93,15 @@ const execFilePromise = (
 ) => {
 	return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
 		let settled = false
-		const child = execFile(command, args, options, (error, stdout, stderr) => {
+		const execOptions: ExecFileOptions & { signal?: AbortSignal } = {
+			encoding: "utf8",
+			...options,
+		}
+		const child = execFile(command, args, execOptions, (error, stdout, stderr) => {
 			if (settled) return
 			settled = true
 			if (error) return reject(error)
-			resolve({ stdout, stderr })
+			resolve({ stdout: String(stdout), stderr: String(stderr) })
 		})
 
 		const signal = options.signal
@@ -427,7 +432,7 @@ const threadsMatcher = (url: string) =>
 const getThreadsUsername = (url: string) => {
 	const match = url.match(/threads\.(?:net|com)\/@([^/?#]+)/i)
 	if (!match) return ""
-	const username = match[1].trim()
+	const username = match[1]?.trim() || ""
 	if (!username) return ""
 	return username.startsWith("@") ? username : `@${username}`
 }
@@ -876,7 +881,7 @@ const sanitizeFilePart = (value: string, fallback: string) => {
 }
 
 const resolveTitle = (info: any, isTiktok: boolean) => {
-	const rawTitle = removeHashtagsMentions(`${info?.title || ""}`.trim()).trim()
+	const rawTitle = (removeHashtagsMentions(`${info?.title || ""}`.trim()) ?? "").trim()
 	const normalizedTitle = rawTitle.toLowerCase()
 	if (rawTitle && (!isTiktok || normalizedTitle !== "tiktok video")) {
 		return rawTitle
@@ -1297,7 +1302,7 @@ const downloadAndSend = async (
 			? info.requested_formats
 			: []
 		const isCombined = isRawFormat && requestedFormats.length > 1
-		let outputContainer: "mp4" | "webm" | "mkv" = "mp4"
+		let outputContainer: "mp4" | "webm" | "mkv" | "mhtml" = "mp4"
 		let audioTranscodeCodec: "aac" | "opus" | null = null
 		let audioTranscodeBitrate = "256k"
 		const formatNote = `${info.format_note || ""}`.toLowerCase()
@@ -1559,9 +1564,10 @@ const downloadAndSend = async (
 					)
 				}
 
-				const timeMatch = trimmed.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/)
-				if (timeMatch && durationSeconds) {
-					const timeSeconds = parseHmsToSeconds(timeMatch[1])
+					const timeMatch = trimmed.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/)
+					const timeValue = timeMatch?.[1]
+					if (timeValue && durationSeconds) {
+						const timeSeconds = parseHmsToSeconds(timeValue)
 					if (typeof timeSeconds === "number") {
 						const percent = Math.min(
 							100,
@@ -1961,7 +1967,9 @@ bot.use(async (ctx, next) => {
 bot.command("cookie", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
 	await deleteUserMessage(ctx)
-	await ctx.reply("To update cookies, simply send the 'cookies.txt' file as a document in this chat.")
+	await ctx.reply(
+		"Отправьте один или несколько файлов cookies.txt (текстом). Я объединю их в общий список для разных площадок.",
+	)
 })
 
 bot.command("clear", async (ctx) => {
@@ -2027,10 +2035,38 @@ bot.on("message:document", async (ctx) => {
 		}
 		const absPath = resolve("/var/lib/telegram-bot-api", bot.token, file.file_path)
 		const newContent = await readFile(absPath, "utf-8")
+		let existingContent = ""
+		try {
+			existingContent = await readFile(COOKIE_FILE, "utf-8")
+		} catch {}
 
-		await writeFile(COOKIE_FILE, newContent)
-		
-		await ctx.reply(`Cookies appended successfully!\nLocation: ${COOKIE_FILE}`)
+		const mergeResult = mergeCookieContent(existingContent, newContent)
+		await writeFile(COOKIE_FILE, mergeResult.content)
+
+		const warnings: string[] = []
+		if (mergeResult.incomingCookieLines === 0) {
+			warnings.push("В файле не найдено cookie-строк.")
+		} else if (mergeResult.invalidIncoming > 0) {
+			warnings.push(
+				`Некорректные строки: ${mergeResult.invalidIncoming}. Пример формата: ${cookieFormatExample}`,
+			)
+		}
+
+		const details = [
+			`Добавлено: ${mergeResult.addedCookies}`,
+			`Всего: ${mergeResult.totalCookies}`,
+			`Location: ${COOKIE_FILE}`,
+		]
+		const suffix = warnings.length > 0 ? `\n${warnings.join("\n")}` : ""
+
+		console.log("Cookies merge stats:", {
+			added: mergeResult.addedCookies,
+			total: mergeResult.totalCookies,
+			incoming: mergeResult.incomingCookieLines,
+			invalid: mergeResult.invalidIncoming,
+		})
+
+		await ctx.reply(`Cookies объединены и сохранены.\n${details.join("\n")}${suffix}`)
 	} catch (error) {
 		console.error(error)
 		let debugInfo = ""
@@ -2193,7 +2229,7 @@ bot.on("message:text", async (ctx, next) => {
 			if (!requestId) {
 				throw new Error("Failed to generate request ID.")
 			}
-			const filteredFormats = formats.filter((f) => f.format_id)
+				const filteredFormats = formats.filter((f: any) => f.format_id)
 			const resolvedTitle = resolveTitle(info, isTiktok)
 			const title = bypassTitle || resolvedTitle || info.title
 			requestCache.set(requestId, {
@@ -2209,13 +2245,13 @@ bot.on("message:text", async (ctx, next) => {
 
 			console.log(`[DEBUG] Total formats: ${formats.length}`)
 			console.log(`[DEBUG] Filtered formats count: ${filteredFormats.length}`)
-			console.log(
-				`[DEBUG] Filtered format IDs: ${filteredFormats.map((f) => f.format_id).join(", ")}`,
-			)
+				console.log(
+					`[DEBUG] Filtered format IDs: ${filteredFormats.map((f: any) => f.format_id).join(", ")}`,
+				)
 
 			const { dashEntries, hlsEntries, mhtmlEntries } =
 				splitFormatEntries(filteredFormats)
-			const hasMp3 = filteredFormats.some((f) => f.format_id === "251")
+				const hasMp3 = filteredFormats.some((f: any) => f.format_id === "251")
 
 			await sendFormatSelector(
 				ctx,
@@ -2442,7 +2478,10 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		)
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
-		const title = bypassTitle || resolvedTitle || removeHashtagsMentions(info.title)
+			const title =
+				bypassTitle ||
+				resolvedTitle ||
+				(removeHashtagsMentions(info.title) ?? "")
 
 		// If group chat OR always download best is enabled -> Auto download
 		if (!isPrivate || ALWAYS_DOWNLOAD_BEST) {

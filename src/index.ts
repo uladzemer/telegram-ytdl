@@ -2051,6 +2051,11 @@ bot.on("message:document", async (ctx) => {
 				`Некорректные строки: ${mergeResult.invalidIncoming}. Пример формата: ${cookieFormatExample}`,
 			)
 		}
+		if (mergeResult.incomingHttpOnlyLines > 0) {
+			warnings.push(
+				`HttpOnly-строки сохранены: ${mergeResult.incomingHttpOnlyLines}`,
+			)
+		}
 
 		const details = [
 			`Добавлено: ${mergeResult.addedCookies}`,
@@ -2064,6 +2069,7 @@ bot.on("message:document", async (ctx) => {
 			total: mergeResult.totalCookies,
 			incoming: mergeResult.incomingCookieLines,
 			invalid: mergeResult.invalidIncoming,
+			httpOnly: mergeResult.incomingHttpOnlyLines,
 		})
 
 		await ctx.reply(`Cookies объединены и сохранены.\n${details.join("\n")}${suffix}`)

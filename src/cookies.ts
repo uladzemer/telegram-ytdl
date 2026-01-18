@@ -4,9 +4,11 @@ type MergeCookieResult = {
 	totalCookies: number
 	incomingCookieLines: number
 	invalidIncoming: number
+	incomingHttpOnlyLines: number
 }
 
 const isValidCookieLine = (line: string) => line.split("\t").length >= 7
+const isHttpOnlyCookieLine = (line: string) => line.startsWith("#HttpOnly_")
 
 export const mergeCookieContent = (
 	existing: string,
@@ -19,12 +21,14 @@ export const mergeCookieContent = (
 	let invalidIncoming = 0
 	let incomingCookieLines = 0
 	let addedCookies = 0
+	let incomingHttpOnlyLines = 0
 
 	const addLines = (content: string, countIncoming: boolean) => {
 		for (const line of content.split(/\r?\n/)) {
 			const trimmed = line.trim()
 			if (!trimmed) continue
-			if (trimmed.startsWith("#")) {
+			const isHttpOnly = isHttpOnlyCookieLine(trimmed)
+			if (trimmed.startsWith("#") && !isHttpOnly) {
 				if (!headerSet.has(trimmed)) {
 					headerSet.add(trimmed)
 					headerLines.push(trimmed)
@@ -33,6 +37,9 @@ export const mergeCookieContent = (
 			}
 			if (countIncoming) {
 				incomingCookieLines += 1
+				if (isHttpOnly) {
+					incomingHttpOnlyLines += 1
+				}
 				if (!isValidCookieLine(trimmed)) {
 					invalidIncoming += 1
 				}
@@ -61,6 +68,7 @@ export const mergeCookieContent = (
 		totalCookies: cookieLines.length,
 		incomingCookieLines,
 		invalidIncoming,
+		incomingHttpOnlyLines,
 	}
 }
 

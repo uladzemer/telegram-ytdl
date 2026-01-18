@@ -1190,21 +1190,23 @@ const downloadAndSend = async (
 			}
 		} else if (quality === "audio") {
 			formatArgs = ["-x", "--audio-format", "mp3"]
-		} else if (quality === "b") {
-			if (isYouTube) {
-				formatArgs = [
-					"-f",
-					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
-				]
-				fallbackFormatArgs = [
-					"-f",
-					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-				]
-			} else {
-				formatArgs = [
-					"-f",
-					"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-				]
+			} else if (quality === "b") {
+				if (isYouTube) {
+					formatArgs = [
+						"-f",
+						"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+					]
+					fallbackFormatArgs = [
+						"-f",
+						"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					]
+				} else if (isErome) {
+					formatArgs = ["-f", "best[ext=mp4]/best"]
+				} else {
+					formatArgs = [
+						"-f",
+						"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					]
 			}
 		} else {
 			if (isYouTube) {

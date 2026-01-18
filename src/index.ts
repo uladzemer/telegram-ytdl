@@ -1497,12 +1497,13 @@ const downloadAndSend = async (
 				formatArgsBase.includes("--js-runtimes") || skipJsRuntime
 					? formatArgsBase
 					: [...jsRuntimeArgs, ...formatArgsBase]
-			let progressText = "Скачиваем..."
-			let fileSize = estimatedSizeLabel
-			let downloadedSize = ""
-			let lastProgressAt = Date.now()
-			let progressBuffer = ""
-			let progressStage: "download" | "muxing" | "converting" = "download"
+				let progressText = "Скачиваем..."
+				let fileSize = estimatedSizeLabel
+				let downloadedSize = ""
+				let lastProgressAt = Date.now()
+				let progressBuffer = ""
+				let lastPercentValue: number | null = null
+				let progressStage: "download" | "muxing" | "converting" = "download"
 			const durationSeconds =
 				typeof info.duration === "number" && info.duration > 0
 					? info.duration
@@ -1522,9 +1523,10 @@ const downloadAndSend = async (
 					lower.includes("merging formats into") ||
 					(lower.includes("[ffmpeg]") && lower.includes("merge"))
 				) {
-					progressStage = "muxing"
-					progressText = muxingLabel
-					return updateMessage(
+						progressStage = "muxing"
+						progressText = muxingLabel
+						lastPercentValue = null
+						return updateMessage(
 						ctx,
 						statusMessageId,
 						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
@@ -1536,9 +1538,10 @@ const downloadAndSend = async (
 					lower.includes("converting") ||
 					(lower.includes("[ffmpeg]") && lower.includes("conversion"))
 				) {
-					progressStage = "converting"
-					progressText = convertingLabel
-					return updateMessage(
+						progressStage = "converting"
+						progressText = convertingLabel
+						lastPercentValue = null
+						return updateMessage(
 						ctx,
 						statusMessageId,
 						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
@@ -1547,42 +1550,59 @@ const downloadAndSend = async (
 
 				if (progressStage !== "download") return
 
-				if (trimmed.includes("[download]")) {
-					const sizeMatch = trimmed.match(/of\s+(?:~?\s*)?([\d.,]+\s*\w+B)/)
-					if (sizeMatch?.[1]) {
-						fileSize = sizeMatch[1]
-					}
+					if (trimmed.includes("[download]")) {
+						const sizeMatch = trimmed.match(/of\s+(?:~?\s*)?([\d.,]+\s*\w+B)/)
+						if (sizeMatch?.[1]) {
+							fileSize = sizeMatch[1]
+						}
 
-					const percentageMatch = trimmed.match(/(\d+(?:[.,]\d+)?)%/)
-					if (percentageMatch) {
-						progressText = `Скачиваем: ${percentageMatch[1]}%`
-						if (fileSize) {
-							progressText += ` из ${fileSize}`
+						const percentageMatch = trimmed.match(/(\d+(?:[.,]\d+)?)%/)
+						const percentValueRaw = percentageMatch?.[1]
+						if (percentValueRaw) {
+							const rawPercent = Number.parseFloat(
+								percentValueRaw.replace(",", "."),
+							)
+							if (
+								Number.isFinite(rawPercent) &&
+								(lastPercentValue === null || rawPercent >= lastPercentValue)
+							) {
+								lastPercentValue = rawPercent
+								progressText = `Скачиваем: ${percentValueRaw}%`
+							}
+							if (fileSize) {
+								progressText += ` из ${fileSize}`
+							}
+							if (percentValueRaw === "100.0" && isCombined) {
+								progressText = muxingLabel
+							}
 						}
-						if (percentageMatch[1] === "100.0" && isCombined) {
-							progressText = muxingLabel
-						}
+						return updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
+						)
 					}
-					return updateMessage(
-						ctx,
-						statusMessageId,
-						`Обработка: <b>${title}</b>\nСтатус: ${progressText}`,
-					)
-				}
 
 					const timeMatch = trimmed.match(/time=(\d+:\d+:\d+(?:\.\d+)?)/)
 					const timeValue = timeMatch?.[1]
-					if (timeValue && durationSeconds) {
-						const timeSeconds = parseHmsToSeconds(timeValue)
-					if (typeof timeSeconds === "number") {
-						const percent = Math.min(
-							100,
-							(timeSeconds / durationSeconds) * 100,
-						)
-						const percentLabel = percent.toFixed(1).replace(/\.0$/, "")
-						progressText = `Скачиваем: ${percentLabel}%`
-						const sizeMatch = trimmed.match(
-							/size=\s*([0-9.]+\s*[A-Za-z]+B)/,
+						if (timeValue && durationSeconds) {
+							const timeSeconds = parseHmsToSeconds(timeValue)
+						if (typeof timeSeconds === "number") {
+							const percent = Math.min(
+								100,
+								(timeSeconds / durationSeconds) * 100,
+							)
+							const percentLabel = percent.toFixed(1).replace(/\.0$/, "")
+							if (
+								lastPercentValue !== null &&
+								percent + 0.1 < lastPercentValue
+							) {
+								return
+							}
+							lastPercentValue = percent
+							progressText = `Скачиваем: ${percentLabel}%`
+							const sizeMatch = trimmed.match(
+								/size=\s*([0-9.]+\s*[A-Za-z]+B)/,
 						)
 						if (sizeMatch?.[1]) {
 							downloadedSize = sizeMatch[1].replace(/\s+/g, "")
@@ -1627,9 +1647,10 @@ const downloadAndSend = async (
 			const runDownload = async (
 				args: string[],
 				extraArgs: string[],
-				cookieArgsOverride: string[] = cookieArgsList,
-			) => {
-				await spawnPromise(
+					cookieArgsOverride: string[] = cookieArgsList,
+				) => {
+					lastPercentValue = null
+					await spawnPromise(
 					"yt-dlp",
 					[
 						url,

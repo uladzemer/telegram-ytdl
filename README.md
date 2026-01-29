@@ -38,6 +38,7 @@ docker compose up -d
 | `TELEGRAM_WEBHOOK_PORT` | Порт вебхука (если используете вебхук)                                                                                     |
 | `TELEGRAM_WEBHOOK_URL`  | URL вебхука (если используете вебхук)                                                                                      |
 | `YTDL_AUTOUPDATE`       | Автообновление yt-dlp (`"true"` или `"false"`, по умолчанию `"true"`)                                                      |
+| `YTDL_PROXY`            | Прокси для yt-dlp (например `socks5://user:pass@host:port`, по умолчанию не задан)                                         |
 | `OPENAI_API_KEY`        | Ключ OpenAI (опционально, авто‑переводы)                                                                                   |
 | `CLEANUP_INTERVAL_HOURS` | Интервал очистки временных файлов в /tmp (часы, по умолчанию 6)                                                            |
 | `CLEANUP_MAX_AGE_HOURS`  | Максимальный возраст временных файлов в /tmp (часы, по умолчанию 12)                                                       |
@@ -46,6 +47,9 @@ docker compose up -d
 
 - Куки складывайте в `./yakachokbot/cookies.txt` или отправляйте в чат боту файл(ы) `cookies.txt` — бот объединит их в один список (полезно для разных площадок).
 - В `./yakachokbot` также хранится `saved-translations.json`, если включены авто‑переводы.
+- Прокси для yt-dlp можно задать командой `/proxy <url>` (админ) или файлом `./yakachokbot/proxy.txt`. Сброс: `/proxy off`.
+- Блокировка пользователей: `/ban <id> [причина]`, снятие: `/unban <id>`, профиль: `/user <id>` (или ответом на сообщение). Список банов хранится в `./yakachokbot/bans.json`, кэш профилей — в `./yakachokbot/users.json`.
+- Статистика (админ): `/stats` — всего пользователей, активные за 24ч/7д/30д, общее число запросов/скачиваний, топ по запросам.
 
 ## Как получить cookies.txt
 

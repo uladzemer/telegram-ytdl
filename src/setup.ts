@@ -57,6 +57,11 @@ if (WEBHOOK_URL) {
 				{ command: "cancel", description: "Отменить все задания" },
 				{ command: "cookie", description: "Upload cookies info" },
 				{ command: "clear", description: "Clear cookies" },
+				{ command: "proxy", description: "Set proxy for yt-dlp" },
+				{ command: "user", description: "Show user profile" },
+				{ command: "ban", description: "Ban user by ID" },
+				{ command: "unban", description: "Unban user by ID" },
+				{ command: "stats", description: "Show user stats" },
 			],
 			{ scope: { type: "chat", chat_id: ADMIN_ID } },
 		)
@@ -82,6 +87,11 @@ if (WEBHOOK_URL) {
 					{ command: "cancel", description: "Отменить все задания" },
 					{ command: "cookie", description: "Upload cookies info" },
 					{ command: "clear", description: "Clear cookies" },
+					{ command: "proxy", description: "Set proxy for yt-dlp" },
+					{ command: "user", description: "Show user profile" },
+					{ command: "ban", description: "Ban user by ID" },
+					{ command: "unban", description: "Unban user by ID" },
+					{ command: "stats", description: "Show user stats" },
 				],
 				{ scope: { type: "chat", chat_id: ADMIN_ID } },
 			)

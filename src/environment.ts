@@ -27,6 +27,7 @@ export const WHITELISTED_IDS = getVariable("WHITELISTED_IDS", "")
 export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "true") !== "false"
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
+export const YTDL_PROXY = getVariable("YTDL_PROXY", "")
 export const ALWAYS_DOWNLOAD_BEST = getVariable("ALWAYS_DOWNLOAD_BEST", "false") !== "false"
 export const CLEANUP_INTERVAL_HOURS = Number.parseInt(
 	getVariable("CLEANUP_INTERVAL_HOURS", "6"),
@@ -36,6 +37,9 @@ export const CLEANUP_MAX_AGE_HOURS = Number.parseInt(
 )
 
 export const COOKIE_FILE = resolve(__dirname, "../storage/cookies.txt")
+export const PROXY_FILE = resolve(__dirname, "../storage/proxy.txt")
+export const USERS_FILE = resolve(__dirname, "../storage/users.json")
+export const BANS_FILE = resolve(__dirname, "../storage/bans.json")
 export const cookieArgs = async () => {
 	try {
 		const stats = await stat(COOKIE_FILE)

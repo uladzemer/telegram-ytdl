@@ -24,6 +24,10 @@ import {
 	CLEANUP_MAX_AGE_HOURS,
 	COOKIE_FILE,
 	cookieArgs,
+	BANS_FILE,
+	PROXY_FILE,
+	USERS_FILE,
+	YTDL_PROXY,
 	WHITELISTED_IDS,
 } from "./environment"
 import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
@@ -338,6 +342,132 @@ const safeGetInfo = async (
 	throw new Error("No valid JSON found in yt-dlp output")
 }
 
+type UserProfile = {
+	id: number
+	username?: string
+	first_name?: string
+	last_name?: string
+	language_code?: string
+	is_bot?: boolean
+	last_seen?: string
+	chat_id?: number
+	requests?: number
+	downloads?: number
+}
+
+type BanEntry = {
+	id: number
+	at: number
+	by: number
+	reason?: string
+}
+
+type UserReport = {
+	id: string
+	userId: number
+	chatId: number
+	messageId?: number
+	context?: string
+	error?: string
+	promptText?: string
+	createdAt: number
+}
+
+const users = new Map<number, UserProfile>()
+let usersLoaded = false
+let usersSaveTimer: NodeJS.Timeout | undefined
+
+const bans = new Map<number, BanEntry>()
+let bansLoaded = false
+
+const userReports = new Map<string, UserReport>()
+
+const loadUsers = async () => {
+	if (usersLoaded) return
+	usersLoaded = true
+	try {
+		const raw = await readFile(USERS_FILE, "utf-8")
+		const data = JSON.parse(raw) as { users?: Record<string, UserProfile> }
+		const entries = data?.users ?? {}
+		for (const [key, value] of Object.entries(entries)) {
+			const id = Number.parseInt(key)
+			if (Number.isNaN(id)) continue
+			users.set(id, { ...value, id })
+		}
+	} catch {}
+}
+
+const saveUsers = async () => {
+	const entries: Record<string, UserProfile> = {}
+	for (const [id, profile] of users.entries()) {
+		entries[String(id)] = profile
+	}
+	await writeFile(USERS_FILE, JSON.stringify({ users: entries }, null, 2))
+}
+
+const scheduleUsersSave = () => {
+	if (usersSaveTimer) return
+	usersSaveTimer = setTimeout(() => {
+		usersSaveTimer = undefined
+		saveUsers().catch((error) => {
+			console.error("Failed to save users:", error)
+		})
+	}, 2000)
+}
+
+const incrementUserCounter = async (
+	userId: number,
+	field: "requests" | "downloads",
+) => {
+	await loadUsers()
+	const existing = users.get(userId) || { id: userId }
+	const next = (existing[field] ?? 0) + 1
+	users.set(userId, { ...existing, [field]: next })
+	scheduleUsersSave()
+}
+
+const loadBans = async () => {
+	if (bansLoaded) return
+	bansLoaded = true
+	try {
+		const raw = await readFile(BANS_FILE, "utf-8")
+		const data = JSON.parse(raw) as { bans?: Record<string, BanEntry> }
+		const entries = data?.bans ?? {}
+		for (const [key, value] of Object.entries(entries)) {
+			const id = Number.parseInt(key)
+			if (Number.isNaN(id)) continue
+			bans.set(id, { ...value, id })
+		}
+	} catch {}
+}
+
+const saveBans = async () => {
+	const entries: Record<string, BanEntry> = {}
+	for (const [id, entry] of bans.entries()) {
+		entries[String(id)] = entry
+	}
+	await writeFile(BANS_FILE, JSON.stringify({ bans: entries }, null, 2))
+}
+
+const isBanned = async (userId: number) => {
+	await loadBans()
+	return bans.has(userId)
+}
+
+const readProxyValue = async () => {
+	const fromEnv = YTDL_PROXY.trim()
+	try {
+		const stored = (await readFile(PROXY_FILE, "utf-8")).trim()
+		if (stored) return stored
+	} catch {}
+	return fromEnv
+}
+
+const getProxyArgs = async () => {
+	const proxy = await readProxyValue()
+	return proxy ? ["--proxy", proxy] : []
+}
+
 const safeGetInfoWithFallback = async (
 	url: string,
 	args: string[],
@@ -346,12 +476,21 @@ const safeGetInfoWithFallback = async (
 	fallbackArgs: string[][] = [],
 ) => {
 	let lastError: unknown
+	const hasProxyArg =
+		args.includes("--proxy") ||
+		fallbackArgs.some((entry) => entry.includes("--proxy"))
+	const proxyArgs = hasProxyArg ? [] : await getProxyArgs()
+	const proxyFallbacks =
+		proxyArgs.length > 0 ? [...fallbackArgs, proxyArgs] : fallbackArgs
 	try {
 		return await safeGetInfo(url, args, signal, skipJsRuntime)
 	} catch (error) {
 		lastError = error
 	}
-	for (const extraArgs of fallbackArgs) {
+	if (proxyArgs.length > 0) {
+		console.log("[DEBUG] Retrying yt-dlp with proxy for info fetch")
+	}
+	for (const extraArgs of proxyFallbacks) {
 		try {
 			return await safeGetInfo(
 				url,
@@ -670,6 +809,7 @@ const enqueueJob = (
 	lockId: string,
 	executor: (signal: AbortSignal) => Promise<void>,
 ) => {
+	void incrementUserCounter(userId, "downloads")
 	const normalized = normalizeUrl(url)
 	const jobId = randomUUID()
 	const controller = new AbortController()
@@ -1244,6 +1384,65 @@ const sendCombineAudioSection = async (
 const isAbortError = (error: unknown) =>
 	error instanceof Error && error.message === "Cancelled"
 
+const formatUserIdLinkHtml = (userId: number) =>
+	`<a href="tg://user?id=${userId}">${userId}</a>`
+
+const createUserReportPrompt = async (
+	ctx: any,
+	context?: string,
+	error?: string,
+) => {
+	await ctx.reply(
+		"Ошибка! разработчик уже в курсе, проверим, попробуем поправить.",
+	)
+}
+
+const formatUserLabel = (profile: UserProfile) => {
+	const name = [profile.first_name, profile.last_name].filter(Boolean).join(" ")
+	const username = profile.username ? `@${profile.username}` : ""
+	if (name && username) return `${name} (${username})`
+	return name || username || "Unknown"
+}
+
+const formatUserProfile = (profile: UserProfile, banEntry?: BanEntry) => {
+	const lines = [
+		`ID: ${profile.id}`,
+		`Name: ${formatUserLabel(profile)}`,
+		`Username: ${profile.username ? `@${profile.username}` : "—"}`,
+		`Lang: ${profile.language_code || "—"}`,
+		`Is bot: ${profile.is_bot ? "yes" : "no"}`,
+		`Last seen: ${profile.last_seen || "—"}`,
+		`Chat ID: ${profile.chat_id ?? "—"}`,
+	]
+	if (banEntry) {
+		const at = new Date(banEntry.at).toISOString()
+		const reason = banEntry.reason || "—"
+		lines.push(`Banned: yes`, `Ban at: ${at}`, `Reason: ${reason}`)
+	} else {
+		lines.push("Banned: no")
+	}
+	return lines.join("\n")
+}
+
+const getUserFromArgs = async (ctx: any, args: string[]) => {
+	if (ctx.message?.reply_to_message?.from) {
+		const from = ctx.message.reply_to_message.from
+		return {
+			id: from.id,
+			username: from.username,
+			first_name: from.first_name,
+			last_name: from.last_name,
+			language_code: from.language_code,
+			is_bot: from.is_bot,
+		} as UserProfile
+	}
+	if (args.length === 0) return null
+	const id = Number.parseInt(args[0], 10)
+	if (Number.isNaN(id)) return null
+	await loadUsers()
+	return users.get(id) || { id }
+}
+
 const downloadAndSend = async (
 	ctx: any,
 	url: string,
@@ -1283,6 +1482,7 @@ const downloadAndSend = async (
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+		const proxyArgs = await getProxyArgs()
 
 		let isMp3Format = selectedIsRawFormat && selectedQuality === "mp3"
 		let isAudioRequest =
@@ -2021,6 +2221,27 @@ const downloadAndSend = async (
 						cookies: cookieArgsList,
 					},
 				]
+				if (proxyArgs.length > 0) {
+					hlsAttempts.push(
+						{
+							label:
+								`Обработка: <b>${title}</b>\nСтатус: HLS: пробуем через прокси без cookies...`,
+							extraArgs: [...hlsPoTokenArgs, ...proxyArgs],
+							cookies: [] as string[],
+						},
+						{
+							label:
+								`Обработка: <b>${title}</b>\nСтатус: HLS: пробуем через прокси с cookies...`,
+							extraArgs: [
+								...hlsPoTokenArgs,
+								...proxyArgs,
+								...impersonateArgs,
+								...youtubeArgs,
+							],
+							cookies: cookieArgsList,
+						},
+					)
+				}
 				for (const attempt of hlsAttempts) {
 					if (statusMessageId) {
 						await updateMessage(ctx, statusMessageId, attempt.label)
@@ -2086,6 +2307,26 @@ const downloadAndSend = async (
 							break
 						} catch (fallbackError) {
 							lastDownloadError = fallbackError
+						}
+					}
+					if (!downloadSucceeded && proxyArgs.length > 0) {
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								`Обработка: <b>${title}</b>\nСтатус: пробуем через прокси...`,
+							)
+						}
+						console.log("[DEBUG] Retrying yt-dlp download via proxy")
+						try {
+							await runDownload(
+								downloadArgs,
+								[...baseExtraArgs, ...proxyArgs],
+								cookieArgsList,
+							)
+							downloadSucceeded = true
+						} catch (proxyError) {
+							lastDownloadError = proxyError
 						}
 					}
 				}
@@ -2296,20 +2537,34 @@ const downloadAndSend = async (
 	} catch (error) {
 		if (isAbortError(error)) return
 		console.error(`[ERROR] Failed to download/send ${url}:`, error)
+		if (ctx.chat?.type === "private") {
+			await createUserReportPrompt(
+				ctx,
+				`URL: ${cleanUrl(url)}`,
+				error instanceof Error ? error.message : "Unknown error",
+			)
+		}
 		await notifyAdminError(
 			ctx.chat,
 			`URL: ${cleanUrl(url)}`,
 			error instanceof Error ? error.message : "Unknown error",
+			ctx.from,
+			ctx.message,
 		)
-		const msg = "Ошибка."
-		if (statusMessageId) {
-			await updateMessage(ctx, statusMessageId, msg)
-		} else if (ctx.callbackQuery) {
-			await ctx.editMessageText(msg)
-		} else if (ctx.chat.type === "private") {
-			await ctx.reply(msg)
-		}
-	} finally {
+				const msg = "Ошибка."
+				if (statusMessageId) {
+					await updateMessage(ctx, statusMessageId, msg)
+				} else if (ctx.callbackQuery) {
+					await ctx.editMessageText(msg)
+				} else if (ctx.chat.type === "private") {
+					await createUserReportPrompt(
+						ctx,
+						`URL: ${cleanUrl(url)}`,
+						error instanceof Error ? error.message : "Unknown error",
+					)
+					await ctx.reply(msg)
+				}
+			} finally {
 		try {
 			await rm(tempDir, { recursive: true, force: true })
 		} catch {}
@@ -2317,6 +2572,31 @@ const downloadAndSend = async (
 }
 
 bot.use(async (ctx, next) => {
+	const from = ctx.from
+	if (from?.id) {
+		await loadUsers()
+		const existing = users.get(from.id) || { id: from.id }
+		const updated: UserProfile = {
+			...existing,
+			id: from.id,
+			username: from.username ?? existing.username,
+			first_name: from.first_name ?? existing.first_name,
+			last_name: from.last_name ?? existing.last_name,
+			language_code: from.language_code ?? existing.language_code,
+			is_bot: from.is_bot ?? existing.is_bot,
+			last_seen: new Date().toISOString(),
+			chat_id: ctx.chat?.id ?? existing.chat_id,
+		}
+		users.set(from.id, updated)
+		scheduleUsersSave()
+		if (await isBanned(from.id)) {
+			if (ctx.chat?.type === "private") {
+				await ctx.reply("Вы заблокированы.")
+			}
+			return
+		}
+	}
+
 	if (ctx.chat?.type === "private") {
 		return await next()
 	}
@@ -2372,6 +2652,165 @@ bot.command("clear", async (ctx) => {
 		requestCache.clear()
 		await ctx.reply("Queue and cache cleared. Cookies file was not found.")
 	}
+})
+
+bot.command("proxy", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	const text = ctx.message?.text || ""
+	const args = text.split(/\s+/).slice(1)
+	if (args.length === 0) {
+		const current = await readProxyValue()
+		if (current) {
+			await ctx.reply(`Proxy: ${code(current)}`)
+		} else {
+			await ctx.reply(
+				[
+					"Proxy не задан.",
+					"Формат: /proxy <scheme>://<user>:<pass>@<host>:<port>",
+					"Примеры:",
+					code("socks5://login:password@1.2.3.4:1080"),
+					code("http://login:password@proxy.example.com:3128"),
+					"Сброс: /proxy off",
+				].join("\n"),
+			)
+		}
+		return
+	}
+	const value = args.join(" ").trim()
+	if (!value || value.toLowerCase() === "off" || value.toLowerCase() === "clear") {
+		try {
+			await unlink(PROXY_FILE)
+		} catch {}
+		await ctx.reply("Proxy очищен.")
+		return
+	}
+	await writeFile(PROXY_FILE, value)
+	await ctx.reply("Proxy обновлен.")
+})
+
+bot.command("user", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	const text = ctx.message?.text || ""
+	const args = text.split(/\s+/).slice(1)
+	const target = await getUserFromArgs(ctx, args)
+	if (!target) {
+		await ctx.reply("Формат: /user <id> (или ответом на сообщение)")
+		return
+	}
+	await loadUsers()
+	const profile = users.get(target.id) || target
+	await loadBans()
+	const banEntry = bans.get(target.id)
+	let resolvedProfile = profile
+	if (!profile.username && !profile.first_name) {
+		try {
+			const chat = await ctx.api.getChat(target.id)
+			resolvedProfile = {
+				...profile,
+				id: chat.id,
+				username: "username" in chat ? chat.username : undefined,
+				first_name: "first_name" in chat ? chat.first_name : undefined,
+				last_name: "last_name" in chat ? chat.last_name : undefined,
+			}
+		} catch {}
+	}
+	await ctx.reply(code(formatUserProfile(resolvedProfile, banEntry)))
+})
+
+bot.command("ban", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	const text = ctx.message?.text || ""
+	const args = text.split(/\s+/).slice(1)
+	const target = await getUserFromArgs(ctx, args)
+	if (!target) {
+		await ctx.reply("Формат: /ban <id> [причина] (или ответом на сообщение)")
+		return
+	}
+	const reason = args.length > 1 ? args.slice(1).join(" ").trim() : ""
+	await loadBans()
+	bans.set(target.id, {
+		id: target.id,
+		at: Date.now(),
+		by: ctx.from.id,
+		reason: reason || undefined,
+	})
+	await saveBans()
+	await ctx.reply(`Пользователь ${code(String(target.id))} заблокирован.`)
+})
+
+bot.command("unban", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	const text = ctx.message?.text || ""
+	const args = text.split(/\s+/).slice(1)
+	const target = await getUserFromArgs(ctx, args)
+	if (!target) {
+		await ctx.reply("Формат: /unban <id> (или ответом на сообщение)")
+		return
+	}
+	await loadBans()
+	if (bans.delete(target.id)) {
+		await saveBans()
+		await ctx.reply(`Пользователь ${code(String(target.id))} разблокирован.`)
+		return
+	}
+	await ctx.reply(`Пользователь ${code(String(target.id))} не был в бане.`)
+})
+
+bot.command("stats", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	await loadUsers()
+	await loadBans()
+	const now = Date.now()
+	const dayMs = 24 * 60 * 60 * 1000
+	const active24h = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= dayMs
+	}).length
+	const active7d = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= 7 * dayMs
+	}).length
+	const active30d = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= 30 * dayMs
+	}).length
+
+	let totalRequests = 0
+	let totalDownloads = 0
+	for (const profile of users.values()) {
+		totalRequests += profile.requests ?? 0
+		totalDownloads += profile.downloads ?? 0
+	}
+
+	const topUsers = Array.from(users.values())
+		.sort((a, b) => (b.requests ?? 0) - (a.requests ?? 0))
+		.slice(0, 5)
+		.map((u, idx) => {
+			const label = formatUserLabel(u)
+			const count = u.requests ?? 0
+			return `${idx + 1}. ${label} (id: ${u.id}) — ${count}`
+		})
+
+	const lines = [
+		bold("Stats"),
+		`Users: ${users.size}`,
+		`Banned: ${bans.size}`,
+		`Active 24h: ${active24h}`,
+		`Active 7d: ${active7d}`,
+		`Active 30d: ${active30d}`,
+		`Requests total: ${totalRequests}`,
+		`Downloads total: ${totalDownloads}`,
+		"",
+		bold("Top users by requests"),
+		topUsers.length ? topUsers.join("\n") : "—",
+	]
+
+	await ctx.reply(lines.join("\n"), { parse_mode: "HTML" })
 })
 
 // Handle cookies.txt upload (Admin only)
@@ -2536,6 +2975,7 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.")
 			return
 		}
+		void incrementUserCounter(userId, "requests")
 		const lockId = lockResult.lockId
 		let keepLock = false
 		const processing = await ctx.reply("Получаем форматы...")
@@ -2706,6 +3146,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			})
 			return
 		}
+	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
 	let keepLock = false
 	let lockTransferred = false
@@ -2976,11 +3417,18 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		
 		// Only send errors in private chats to avoid spamming groups
 		if (isPrivate) {
-			const msg =
-				error instanceof Error
-					? errorMessage(ctx.chat, error.message)
-					: errorMessage(ctx.chat, `Couldn't process ${url.text}`)
-			await msg
+			await createUserReportPrompt(
+				ctx,
+				`URL: ${cleanUrl(url.text)}`,
+				error instanceof Error ? error.message : `Couldn't process ${url.text}`,
+			)
+			await notifyAdminError(
+				ctx.chat,
+				`URL: ${cleanUrl(url.text)}`,
+				error instanceof Error ? error.message : `Couldn't process ${url.text}`,
+				ctx.from,
+				ctx.message,
+			)
 		} else {
 			console.error(`Group silent fail for ${url.text}:`, error)
 		}
@@ -3001,6 +3449,102 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 bot.on("callback_query:data", async (ctx) => {
 	const data = ctx.callbackQuery.data
+	if (data.startsWith("ban:")) {
+		if (ctx.from?.id !== ADMIN_ID) {
+			return await ctx.answerCallbackQuery({
+				text: "Not allowed",
+				show_alert: true,
+			})
+		}
+		const [, idText] = data.split(":")
+		const targetId = Number.parseInt(idText || "", 10)
+		if (!Number.isFinite(targetId)) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid user id",
+				show_alert: true,
+			})
+		}
+		await loadBans()
+		bans.set(targetId, {
+			id: targetId,
+			at: Date.now(),
+			by: ctx.from.id,
+			reason: "inline",
+		})
+		await saveBans()
+		try {
+			await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() })
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Пользователь заблокирован" })
+	}
+	if (data.startsWith("unban:")) {
+		if (ctx.from?.id !== ADMIN_ID) {
+			return await ctx.answerCallbackQuery({
+				text: "Not allowed",
+				show_alert: true,
+			})
+		}
+		const [, idText] = data.split(":")
+		const targetId = Number.parseInt(idText || "", 10)
+		if (!Number.isFinite(targetId)) {
+			return await ctx.answerCallbackQuery({
+				text: "Invalid user id",
+				show_alert: true,
+			})
+		}
+		await loadBans()
+		bans.delete(targetId)
+		await saveBans()
+		try {
+			await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() })
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Пользователь разблокирован" })
+	}
+	if (data.startsWith("report:")) {
+		const [, reportId] = data.split(":")
+		const report = reportId ? userReports.get(reportId) : undefined
+		if (!report) {
+			return await ctx.answerCallbackQuery({
+				text: "Запрос устарел",
+				show_alert: true,
+			})
+		}
+		if (ctx.from?.id !== report.userId) {
+			return await ctx.answerCallbackQuery({
+				text: "Not allowed",
+				show_alert: true,
+			})
+		}
+		userReports.delete(reportId)
+		const adminText =
+			report.promptText ||
+			[
+				"Возможно, нам нужно это исправить. Отправить разработчику?",
+				"",
+				`ID: <span class=\"tg-spoiler\">${formatUserIdLinkHtml(report.userId)}</span>`,
+			].join("\n")
+		const keyboard =
+			report.userId !== ADMIN_ID
+				? new InlineKeyboard().text("Ban user", `ban:${report.userId}`)
+				: undefined
+		await bot.api.sendMessage(ADMIN_ID, adminText, {
+			parse_mode: "HTML",
+			reply_markup: keyboard,
+		})
+		if (report.messageId) {
+			try {
+				await bot.api.forwardMessage(
+					ADMIN_ID,
+					report.chatId,
+					report.messageId,
+				)
+			} catch {}
+		}
+		try {
+			await ctx.editMessageReplyMarkup({ reply_markup: new InlineKeyboard() })
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Отправлено" })
+	}
 	if (data.startsWith("f:")) {
 		const [, requestId, listType] = data.split(":")
 		if (!requestId || !listType) {

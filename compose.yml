@@ -27,6 +27,8 @@ services:
       # whether to automatically update yt-dlp
       # defaults to "true", set to "false" to disable
       YTDL_AUTOUPDATE: "true"
+      # optional proxy for yt-dlp (e.g. socks5://user:pass@host:port)
+      YTDL_PROXY: "${YTDL_PROXY}"
 
       # provide your OpenAI API key to enable auto-translation (optional)
       OPENAI_API_KEY: "${OPENAI_API_KEY}"

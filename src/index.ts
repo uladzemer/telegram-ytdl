@@ -2689,6 +2689,30 @@ bot.command("proxy", async (ctx) => {
 	await ctx.reply("Proxy обновлен.")
 })
 
+bot.command("send", async (ctx) => {
+	if (ctx.from?.id !== ADMIN_ID) return
+	await deleteUserMessage(ctx)
+	const text = ctx.message?.text || ""
+	const args = text.split(/\s+/).slice(1)
+	const targetId = Number.parseInt(args[0] || "", 10)
+	if (!Number.isFinite(targetId)) {
+		await ctx.reply("Формат: ответить на медиа и написать /send <id>")
+		return
+	}
+	const replied = ctx.message?.reply_to_message
+	if (!replied) {
+		await ctx.reply("Нужно ответить на сообщение с медиа.")
+		return
+	}
+	try {
+		await bot.api.copyMessage(targetId, replied.chat.id, replied.message_id)
+		await ctx.reply(`Отправлено пользователю ${code(String(targetId))}.`)
+	} catch (error) {
+		await ctx.reply("Не удалось отправить. Проверьте, что пользователь писал боту.")
+		console.error("Failed to send admin media copy:", error)
+	}
+})
+
 bot.command("user", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
 	await deleteUserMessage(ctx)

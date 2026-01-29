@@ -62,6 +62,7 @@ if (WEBHOOK_URL) {
 				{ command: "ban", description: "Ban user by ID" },
 				{ command: "unban", description: "Unban user by ID" },
 				{ command: "stats", description: "Show user stats" },
+				{ command: "send", description: "Send replied media to user" },
 			],
 			{ scope: { type: "chat", chat_id: ADMIN_ID } },
 		)
@@ -92,6 +93,7 @@ if (WEBHOOK_URL) {
 					{ command: "ban", description: "Ban user by ID" },
 					{ command: "unban", description: "Unban user by ID" },
 					{ command: "stats", description: "Show user stats" },
+					{ command: "send", description: "Send replied media to user" },
 				],
 				{ scope: { type: "chat", chat_id: ADMIN_ID } },
 			)

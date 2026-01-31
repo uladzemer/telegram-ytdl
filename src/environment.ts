@@ -28,6 +28,12 @@ export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "true") !== "false"
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
 export const YTDL_PROXY = getVariable("YTDL_PROXY", "")
+export const ADMIN_DASHBOARD_TOKEN = getVariable("ADMIN_DASHBOARD_TOKEN", "")
+export const ADMIN_DASHBOARD_PORT = getVariable("ADMIN_DASHBOARD_PORT", "3000")
+export const ADMIN_DASHBOARD_HOST = getVariable("ADMIN_DASHBOARD_HOST", "127.0.0.1")
+export const ADMIN_ONLY = getVariable("ADMIN_ONLY", "false") === "true"
+export const ADMIN_DASHBOARD_USER = getVariable("ADMIN_DASHBOARD_USER", "")
+export const ADMIN_DASHBOARD_PASSWORD = getVariable("ADMIN_DASHBOARD_PASSWORD", "")
 export const ALWAYS_DOWNLOAD_BEST = getVariable("ALWAYS_DOWNLOAD_BEST", "false") !== "false"
 export const CLEANUP_INTERVAL_HOURS = Number.parseInt(
 	getVariable("CLEANUP_INTERVAL_HOURS", "6"),
@@ -36,10 +42,15 @@ export const CLEANUP_MAX_AGE_HOURS = Number.parseInt(
 	getVariable("CLEANUP_MAX_AGE_HOURS", "12"),
 )
 
-export const COOKIE_FILE = resolve(__dirname, "../storage/cookies.txt")
-export const PROXY_FILE = resolve(__dirname, "../storage/proxy.txt")
-export const USERS_FILE = resolve(__dirname, "../storage/users.json")
-export const BANS_FILE = resolve(__dirname, "../storage/bans.json")
+export const STORAGE_DIR = getVariable("STORAGE_DIR", resolve(__dirname, "../storage"))
+export const COOKIE_FILE = resolve(STORAGE_DIR, "cookies.txt")
+export const PROXY_FILE = resolve(STORAGE_DIR, "proxy.txt")
+export const USERS_FILE = resolve(STORAGE_DIR, "users.json")
+export const BANS_FILE = resolve(STORAGE_DIR, "bans.json")
+export const LINKS_FILE = resolve(STORAGE_DIR, "links.json")
+export const ERRORS_FILE = resolve(STORAGE_DIR, "errors.json")
+export const ACTIVITY_FILE = resolve(STORAGE_DIR, "activity.json")
+export const SYSTEM_HISTORY_FILE = resolve(STORAGE_DIR, "system_history.json")
 export const cookieArgs = async () => {
 	try {
 		const stats = await stat(COOKIE_FILE)

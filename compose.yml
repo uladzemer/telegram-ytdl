@@ -54,6 +54,38 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  admin-panel:
+    build: .
+    restart: unless-stopped
+    volumes:
+      - ./yakachokbot:/app/storage
+    env_file:
+      - .env
+    environment:
+      ADMIN_ONLY: "true"
+      ADMIN_DASHBOARD_HOST: "0.0.0.0"
+      ADMIN_DASHBOARD_PORT: "${ADMIN_DASHBOARD_PORT:-3012}"
+      ADMIN_DASHBOARD_USER: "${ADMIN_DASHBOARD_USER}"
+      ADMIN_DASHBOARD_PASSWORD: "${ADMIN_DASHBOARD_PASSWORD}"
+      STORAGE_DIR: "/app/storage"
+    ports:
+      - "${ADMIN_DASHBOARD_PORT:-3012}:${ADMIN_DASHBOARD_PORT:-3012}"
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${ADMIN_DASHBOARD_PORT:-3012}/admin >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 3
+    mem_limit: 512m
+    cpus: "0.5"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   telegram-bot-api:
     image: aiogram/telegram-bot-api:latest
     restart: unless-stopped

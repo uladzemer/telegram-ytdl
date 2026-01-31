@@ -4,7 +4,16 @@ import type { Context } from "grammy"
 import { hydrateReply } from "@grammyjs/parse-mode"
 import express from "express"
 import { Bot, webhookCallback } from "grammy"
-import { API_ROOT, BOT_TOKEN, WEBHOOK_PORT, WEBHOOK_URL, ADMIN_ID } from "./environment"
+import {
+	ADMIN_ONLY,
+	ADMIN_DASHBOARD_HOST,
+	ADMIN_DASHBOARD_PORT,
+	API_ROOT,
+	BOT_TOKEN,
+	WEBHOOK_PORT,
+	WEBHOOK_URL,
+	ADMIN_ID,
+} from "./environment"
 import { code, bold } from "./constants"
 import { cutoffWithNotice } from "./util"
 
@@ -16,6 +25,10 @@ export const bot = new Bot<ParseModeFlavor<Context>>(BOT_TOKEN, {
 bot.use(hydrateReply)
 
 bot.catch(async (err) => {
+	if (ADMIN_ONLY) {
+		console.error("Bot error (admin-only):", err)
+		return
+	}
 	try {
 		const title = bold("Ошибка бота.")
 		const context = err.ctx?.update ? `Update: ${err.ctx.update.update_id}` : ""
@@ -40,7 +53,24 @@ export const server = express()
 
 server.use(express.json())
 
-if (WEBHOOK_URL) {
+const dashboardPort = Number.parseInt(ADMIN_DASHBOARD_PORT, 10)
+const dashboardHost = ADMIN_DASHBOARD_HOST || "127.0.0.1"
+const webhookPort = Number.parseInt(WEBHOOK_PORT, 10)
+
+const startDashboardServer = () => {
+	if (!Number.isFinite(dashboardPort) || dashboardPort <= 0) {
+		console.warn("ADMIN_DASHBOARD_PORT is invalid, admin panel is disabled.")
+		return
+	}
+	server.listen(dashboardPort, dashboardHost, () => {
+		console.log(`Admin HTTP server listening on http://${dashboardHost}:${dashboardPort}`)
+	})
+}
+
+if (ADMIN_ONLY) {
+	startDashboardServer()
+	console.log("Bot start skipped (ADMIN_ONLY=true).")
+} else if (WEBHOOK_URL) {
 	server.use(webhookCallback(bot, "express"))
 
 	console.log(`Starting bot with root ${API_ROOT}...`)
@@ -71,8 +101,16 @@ if (WEBHOOK_URL) {
 		const me = await bot.api.getMe()
 		console.log(`Bot started as @${me.username} on :${WEBHOOK_PORT}`)
 	})
+
+	if (
+		Number.isFinite(dashboardPort) &&
+		(dashboardPort !== webhookPort || dashboardHost !== "0.0.0.0")
+	) {
+		startDashboardServer()
+	}
 } else {
 	console.log(`Starting bot in POLLING mode with root ${API_ROOT}...`)
+	startDashboardServer()
 	bot.start({
 		drop_pending_updates: true,
 		allowed_updates: ["message", "callback_query", "my_chat_member"],

@@ -9,8 +9,10 @@ import {
 	writeFile,
 } from "node:fs/promises"
 import { dirname, resolve } from "node:path"
+import os from "node:os"
 import { randomUUID } from "node:crypto"
 import { InlineKeyboard, InputFile } from "grammy"
+import type { NextFunction, Request, Response } from "express"
 import { cookieFormatExample, mergeCookieContent } from "./cookies"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
@@ -20,11 +22,19 @@ import {
 	ALLOW_GROUPS,
 	ALWAYS_DOWNLOAD_BEST,
 	API_ROOT,
+	ADMIN_ONLY,
 	CLEANUP_INTERVAL_HOURS,
 	CLEANUP_MAX_AGE_HOURS,
+	ADMIN_DASHBOARD_TOKEN,
+	ADMIN_DASHBOARD_USER,
+	ADMIN_DASHBOARD_PASSWORD,
 	COOKIE_FILE,
 	cookieArgs,
 	BANS_FILE,
+	LINKS_FILE,
+	ERRORS_FILE,
+	ACTIVITY_FILE,
+	SYSTEM_HISTORY_FILE,
 	PROXY_FILE,
 	USERS_FILE,
 	YTDL_PROXY,
@@ -32,7 +42,7 @@ import {
 } from "./environment"
 import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
 import { Queue } from "./queue"
-import { bot } from "./setup"
+import { bot, server } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions, cleanUrl, cutoffWithNotice } from "./util"
@@ -47,6 +57,7 @@ const cleanupMaxAgeHours = Number.isFinite(CLEANUP_MAX_AGE_HOURS)
 	: 12
 
 const notifyAdminLog = async (title: string, error: unknown) => {
+	if (ADMIN_ONLY) return
 	try {
 		const details =
 			error instanceof Error ? error.stack || error.message : String(error)
@@ -382,6 +393,81 @@ let bansLoaded = false
 
 const userReports = new Map<string, UserReport>()
 
+const userLinks = new Map<number, LinkHistoryEntry[]>()
+let userLinksLoaded = false
+let userLinksSaveTimer: NodeJS.Timeout | undefined
+
+const errorLogs: ErrorLogEntry[] = []
+let errorLogsLoaded = false
+let errorLogsSaveTimer: NodeJS.Timeout | undefined
+
+let activitySaveTimer: NodeJS.Timeout | undefined
+
+const systemHistory: SystemHistoryEntry[] = []
+let systemHistoryLoaded = false
+let systemHistorySaveTimer: NodeJS.Timeout | undefined
+
+type UserStatsSnapshot = {
+	generatedAt: string
+	usersTotal: number
+	bannedTotal: number
+	active24h: number
+	active7d: number
+	active30d: number
+	requestsTotal: number
+	downloadsTotal: number
+	queuePending: number
+	queueActive: number
+	activeJobs: number
+	activeUsers: number
+	topUsers: Array<{
+		id: number
+		label: string
+		requests: number
+		downloads: number
+		lastSeen?: string
+	}>
+}
+
+type UserListEntry = {
+	id: number
+	label: string
+	username?: string
+	firstName?: string
+	lastName?: string
+	requests: number
+	downloads: number
+	lastSeen?: string
+	chatId?: number
+	banned?: boolean
+	banAt?: string
+	banReason?: string
+}
+
+type LinkHistoryEntry = {
+	id: string
+	userId: number
+	url: string
+	status: "requested" | "queued" | "success" | "error"
+	at: string
+	error?: string
+}
+
+type ErrorLogEntry = {
+	id: string
+	at: string
+	userId?: number
+	url?: string
+	context?: string
+	error?: string
+}
+
+type SystemHistoryEntry = {
+	at: string
+	load1: number
+	memPercent: number
+}
+
 const loadUsers = async () => {
 	if (usersLoaded) return
 	usersLoaded = true
@@ -449,6 +535,179 @@ const saveBans = async () => {
 	await writeFile(BANS_FILE, JSON.stringify({ bans: entries }, null, 2))
 }
 
+const loadUserLinks = async () => {
+	if (userLinksLoaded) return
+	userLinksLoaded = true
+	try {
+		const raw = await readFile(LINKS_FILE, "utf-8")
+		const data = JSON.parse(raw) as {
+			links?: Record<string, LinkHistoryEntry[]>
+		}
+		for (const [key, value] of Object.entries(data?.links ?? {})) {
+			const id = Number.parseInt(key)
+			if (Number.isNaN(id)) continue
+			if (!Array.isArray(value)) continue
+			const deduped = new Map<string, LinkHistoryEntry>()
+			for (const entry of value) {
+				const current = deduped.get(entry.url)
+				if (!current) {
+					deduped.set(entry.url, entry)
+					continue
+				}
+				const currentIsFinal =
+					current.status === "success" || current.status === "error"
+				const entryIsFinal =
+					entry.status === "success" || entry.status === "error"
+				if (entryIsFinal && !currentIsFinal) {
+					deduped.set(entry.url, entry)
+					continue
+				}
+				if (entryIsFinal === currentIsFinal) {
+					if (Date.parse(entry.at) > Date.parse(current.at)) {
+						deduped.set(entry.url, entry)
+					}
+				}
+			}
+			const list = Array.from(deduped.values()).sort(
+				(a, b) => Date.parse(b.at) - Date.parse(a.at),
+			)
+			userLinks.set(id, list)
+		}
+	} catch {}
+}
+
+const saveUserLinks = async () => {
+	const entries: Record<string, LinkHistoryEntry[]> = {}
+	for (const [id, list] of userLinks.entries()) {
+		entries[String(id)] = list
+	}
+	await writeFile(LINKS_FILE, JSON.stringify({ links: entries }, null, 2))
+}
+
+const scheduleUserLinksSave = () => {
+	if (userLinksSaveTimer) return
+	userLinksSaveTimer = setTimeout(() => {
+		userLinksSaveTimer = undefined
+		saveUserLinks().catch((error) => {
+			console.error("Failed to save user links:", error)
+		})
+	}, 2000)
+}
+
+const loadErrorLogs = async () => {
+	if (errorLogsLoaded) return
+	errorLogsLoaded = true
+	try {
+		const raw = await readFile(ERRORS_FILE, "utf-8")
+		const data = JSON.parse(raw) as { errors?: ErrorLogEntry[] }
+		if (Array.isArray(data?.errors)) {
+			errorLogs.push(...data.errors)
+		}
+	} catch {}
+}
+
+const saveErrorLogs = async () => {
+	await writeFile(ERRORS_FILE, JSON.stringify({ errors: errorLogs }, null, 2))
+}
+
+const scheduleErrorLogsSave = () => {
+	if (errorLogsSaveTimer) return
+	errorLogsSaveTimer = setTimeout(() => {
+		errorLogsSaveTimer = undefined
+		saveErrorLogs().catch((error) => {
+			console.error("Failed to save error logs:", error)
+		})
+	}, 2000)
+}
+
+const saveActivitySnapshot = async () => {
+	const jobs = Array.from(jobMeta.values()).map((job) => ({
+		id: job.id,
+		userId: job.userId,
+		url: job.url,
+		state: job.state,
+	}))
+	const payload = {
+		updatedAt: new Date().toISOString(),
+		pending: queue.getPendingCount(),
+		active: queue.getActiveCount(),
+		jobs,
+	}
+	await writeFile(ACTIVITY_FILE, JSON.stringify(payload, null, 2))
+}
+
+const scheduleActivitySave = () => {
+	if (activitySaveTimer) return
+	activitySaveTimer = setTimeout(() => {
+		activitySaveTimer = undefined
+		saveActivitySnapshot().catch((error) => {
+			console.error("Failed to save activity snapshot:", error)
+		})
+	}, 1000)
+}
+
+const loadSystemHistory = async () => {
+	if (systemHistoryLoaded) return
+	systemHistoryLoaded = true
+	try {
+		const raw = await readFile(SYSTEM_HISTORY_FILE, "utf-8")
+		const data = JSON.parse(raw) as { samples?: SystemHistoryEntry[] }
+		if (Array.isArray(data?.samples)) {
+			systemHistory.push(...data.samples)
+		}
+	} catch {}
+}
+
+const saveSystemHistory = async () => {
+	await writeFile(
+		SYSTEM_HISTORY_FILE,
+		JSON.stringify({ samples: systemHistory }, null, 2),
+	)
+}
+
+const scheduleSystemHistorySave = () => {
+	if (systemHistorySaveTimer) return
+	systemHistorySaveTimer = setTimeout(() => {
+		systemHistorySaveTimer = undefined
+		saveSystemHistory().catch((error) => {
+			console.error("Failed to save system history:", error)
+		})
+	}, 2000)
+}
+
+const recordSystemSample = async () => {
+	await loadSystemHistory()
+	const totalMem = os.totalmem()
+	const freeMem = os.freemem()
+	const usedMem = totalMem - freeMem
+	const memPercent = totalMem ? (usedMem / totalMem) * 100 : 0
+	const load = os.loadavg()
+	systemHistory.push({
+		at: new Date().toISOString(),
+		load1: load[0] ?? 0,
+		memPercent,
+	})
+	const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
+	while (systemHistory.length > 0 && Date.parse(systemHistory[0].at) < cutoff) {
+		systemHistory.shift()
+	}
+	if (systemHistory.length > 10080) {
+		systemHistory.splice(0, systemHistory.length - 10080)
+	}
+	scheduleSystemHistorySave()
+}
+
+const startSystemHistoryCollector = () => {
+	recordSystemSample().catch((error) => {
+		console.error("Failed to record system sample:", error)
+	})
+	setInterval(() => {
+		recordSystemSample().catch((error) => {
+			console.error("Failed to record system sample:", error)
+		})
+	}, 60 * 1000).unref()
+}
+
 const isBanned = async (userId: number) => {
 	await loadBans()
 	return bans.has(userId)
@@ -466,6 +725,213 @@ const readProxyValue = async () => {
 const getProxyArgs = async () => {
 	const proxy = await readProxyValue()
 	return proxy ? ["--proxy", proxy] : []
+}
+
+const logUserLink = async (
+	userId: number | undefined,
+	url: string,
+	status: LinkHistoryEntry["status"],
+	error?: string,
+) => {
+	if (!userId || !url) return
+	await loadUserLinks()
+	const normalized = cleanUrl(url)
+	const list = userLinks.get(userId) ?? []
+	const existingIndex = list.findIndex((item) => item.url === normalized)
+	const existing = existingIndex >= 0 ? list[existingIndex] : undefined
+	const finalStatuses: LinkHistoryEntry["status"][] = ["success", "error"]
+	const isFinal = finalStatuses.includes(status)
+	if (existing) {
+		// Do not overwrite a final status with a non-final update.
+		if (!isFinal && finalStatuses.includes(existing.status)) {
+			return
+		}
+		const updated: LinkHistoryEntry = {
+			...existing,
+			status,
+			at: new Date().toISOString(),
+			error: error ? cutoffWithNotice(String(error)) : existing.error,
+		}
+		list.splice(existingIndex, 1)
+		list.unshift(updated)
+	} else {
+		const entry: LinkHistoryEntry = {
+			id: randomUUID(),
+			userId,
+			url: normalized,
+			status,
+			at: new Date().toISOString(),
+			error: error ? cutoffWithNotice(String(error)) : undefined,
+		}
+		list.unshift(entry)
+	}
+	if (list.length > 200) list.length = 200
+	userLinks.set(userId, list)
+	scheduleUserLinksSave()
+}
+
+const logErrorEntry = async (entry: Omit<ErrorLogEntry, "id" | "at">) => {
+	await loadErrorLogs()
+	errorLogs.unshift({
+		id: randomUUID(),
+		at: new Date().toISOString(),
+		...entry,
+	})
+	if (errorLogs.length > 300) errorLogs.length = 300
+	scheduleErrorLogsSave()
+}
+
+const escapeHtml = (value: string) =>
+	value
+		.replaceAll("&", "&amp;")
+		.replaceAll("<", "&lt;")
+		.replaceAll(">", "&gt;")
+		.replaceAll('"', "&quot;")
+		.replaceAll("'", "&#39;")
+
+const buildUserStatsSnapshot = async (): Promise<UserStatsSnapshot> => {
+	await loadUsers()
+	await loadBans()
+	const now = Date.now()
+	const dayMs = 24 * 60 * 60 * 1000
+	const active24h = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= dayMs
+	}).length
+	const active7d = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= 7 * dayMs
+	}).length
+	const active30d = Array.from(users.values()).filter((u) => {
+		if (!u.last_seen) return false
+		return now - Date.parse(u.last_seen) <= 30 * dayMs
+	}).length
+
+	let requestsTotal = 0
+	let downloadsTotal = 0
+	for (const profile of users.values()) {
+		requestsTotal += profile.requests ?? 0
+		downloadsTotal += profile.downloads ?? 0
+	}
+
+	const topUsers = Array.from(users.values())
+		.sort((a, b) => (b.requests ?? 0) - (a.requests ?? 0))
+		.slice(0, 10)
+		.map((u) => ({
+			id: u.id,
+			label: formatUserLabel(u),
+			requests: u.requests ?? 0,
+			downloads: u.downloads ?? 0,
+			lastSeen: u.last_seen,
+		}))
+
+	const activeJobs = Array.from(jobMeta.values()).filter(
+		(job) => job.state === "active",
+	)
+	const activeUsers = new Set(activeJobs.map((job) => job.userId)).size
+
+	return {
+		generatedAt: new Date().toISOString(),
+		usersTotal: users.size,
+		bannedTotal: bans.size,
+		active24h,
+		active7d,
+		active30d,
+		requestsTotal,
+		downloadsTotal,
+		queuePending: queue.getPendingCount(),
+		queueActive: queue.getActiveCount(),
+		activeJobs: activeJobs.length,
+		activeUsers,
+		topUsers,
+	}
+}
+
+const buildUserList = async (): Promise<UserListEntry[]> => {
+	await loadUsers()
+	await loadBans()
+	const list = Array.from(users.values()).map((u) => {
+		const ban = bans.get(u.id)
+		return {
+			id: u.id,
+			label: formatUserLabel(u),
+			username: u.username,
+			firstName: u.first_name,
+			lastName: u.last_name,
+			requests: u.requests ?? 0,
+			downloads: u.downloads ?? 0,
+			lastSeen: u.last_seen,
+			chatId: u.chat_id,
+			banned: Boolean(ban),
+			banAt: ban ? new Date(ban.at).toISOString() : undefined,
+			banReason: ban?.reason,
+		}
+	})
+	list.sort((a, b) => {
+		const aTime = a.lastSeen ? Date.parse(a.lastSeen) : 0
+		const bTime = b.lastSeen ? Date.parse(b.lastSeen) : 0
+		if (aTime !== bTime) return bTime - aTime
+		return (b.requests ?? 0) - (a.requests ?? 0)
+	})
+	return list
+}
+
+const getUserLinks = async (userId: number) => {
+	await loadUserLinks()
+	return userLinks.get(userId) ?? []
+}
+
+const getAllLinks = async () => {
+	await loadUserLinks()
+	const all: Array<LinkHistoryEntry & { userId: number }> = []
+	for (const [userId, list] of userLinks.entries()) {
+		for (const entry of list) {
+			all.push({ ...entry, userId })
+		}
+	}
+	all.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+	return all
+}
+
+const requireDashboardAuth = (
+	req: Request,
+	res: Response,
+	next: NextFunction,
+) => {
+	const token = ADMIN_DASHBOARD_TOKEN.trim()
+	const user = ADMIN_DASHBOARD_USER.trim()
+	const password = ADMIN_DASHBOARD_PASSWORD
+	if (!token && !(user && password)) {
+		res.status(403).send("Admin auth is not configured.")
+		return
+	}
+
+	const header = req.header("authorization") || ""
+	if (header.toLowerCase().startsWith("basic ")) {
+		const encoded = header.slice(6).trim()
+		try {
+			const decoded = Buffer.from(encoded, "base64").toString("utf8")
+			const [basicUser, basicPass] = decoded.split(":")
+			if (basicUser === user && basicPass === password) {
+				next()
+				return
+			}
+		} catch {}
+		res.setHeader("WWW-Authenticate", "Basic realm=\"Yakachokbot Admin\"")
+		res.status(401).send("Unauthorized")
+		return
+	}
+
+	const bearer = header.startsWith("Bearer ") ? header.slice(7).trim() : ""
+	const queryToken =
+		typeof req.query.token === "string" ? req.query.token.trim() : ""
+	const provided = bearer || queryToken
+	if (provided && provided === token) {
+		next()
+		return
+	}
+	res.setHeader("WWW-Authenticate", "Basic realm=\"Yakachokbot Admin\"")
+	res.status(401).send("Unauthorized")
 }
 
 const safeGetInfoWithFallback = async (
@@ -811,6 +1277,7 @@ const enqueueJob = (
 ) => {
 	void incrementUserCounter(userId, "downloads")
 	const normalized = normalizeUrl(url)
+	void logUserLink(userId, normalized, "queued")
 	const jobId = randomUUID()
 	const controller = new AbortController()
 	jobMeta.set(jobId, {
@@ -821,15 +1288,20 @@ const enqueueJob = (
 		state: "pending",
 		cancel: () => controller.abort(),
 	})
+	scheduleActivitySave()
 	activateUserUrlLock(userId, normalized, lockId)
 	queue.add(async () => {
 		const meta = jobMeta.get(jobId)
-		if (meta) meta.state = "active"
+		if (meta) {
+			meta.state = "active"
+			scheduleActivitySave()
+		}
 		try {
 			await executor(controller.signal)
 		} finally {
 			jobMeta.delete(jobId)
 			unlockUserUrl(userId, normalized, lockId)
+			scheduleActivitySave()
 		}
 	}, jobId)
 	return jobId
@@ -844,12 +1316,18 @@ const cancelUserJobs = (userId: number) => {
 			jobMeta.delete(entry.id)
 		}
 	}
+	if (removed.length > 0) {
+		scheduleActivitySave()
+	}
 	let activeCancelled = 0
 	for (const meta of jobMeta.values()) {
 		if (meta.userId === userId && meta.state === "active") {
 			meta.cancel()
 			activeCancelled++
 		}
+	}
+	if (activeCancelled > 0) {
+		scheduleActivitySave()
 	}
 	const remainingActive = Array.from(jobMeta.values()).filter(
 		(job) => job.userId === userId,
@@ -882,6 +1360,7 @@ const scheduleRequestExpiry = (requestId: string) => {
 	}, 3600000)
 }
 const updater = new Updater()
+startSystemHistoryCollector()
 cleanupTempDirs().catch((error) =>
 	console.error("Temp cleanup error:", error),
 )
@@ -2533,10 +3012,18 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		}
+		await logUserLink(ctx.from?.id, sourceUrl || url, "success")
 		console.log(`[SUCCESS] Sent video to chat ${ctx.chat.id}`)
 	} catch (error) {
 		if (isAbortError(error)) return
 		console.error(`[ERROR] Failed to download/send ${url}:`, error)
+		await logUserLink(ctx.from?.id, sourceUrl || url, "error", String(error))
+		await logErrorEntry({
+			userId: ctx.from?.id,
+			url: sourceUrl || url,
+			context: "download/send",
+			error: error instanceof Error ? error.message : String(error),
+		})
 		if (ctx.chat?.type === "private") {
 			await createUserReportPrompt(
 				ctx,
@@ -2787,54 +3274,1478 @@ bot.command("unban", async (ctx) => {
 bot.command("stats", async (ctx) => {
 	if (ctx.from?.id !== ADMIN_ID) return
 	await deleteUserMessage(ctx)
-	await loadUsers()
-	await loadBans()
-	const now = Date.now()
-	const dayMs = 24 * 60 * 60 * 1000
-	const active24h = Array.from(users.values()).filter((u) => {
-		if (!u.last_seen) return false
-		return now - Date.parse(u.last_seen) <= dayMs
-	}).length
-	const active7d = Array.from(users.values()).filter((u) => {
-		if (!u.last_seen) return false
-		return now - Date.parse(u.last_seen) <= 7 * dayMs
-	}).length
-	const active30d = Array.from(users.values()).filter((u) => {
-		if (!u.last_seen) return false
-		return now - Date.parse(u.last_seen) <= 30 * dayMs
-	}).length
-
-	let totalRequests = 0
-	let totalDownloads = 0
-	for (const profile of users.values()) {
-		totalRequests += profile.requests ?? 0
-		totalDownloads += profile.downloads ?? 0
-	}
-
-	const topUsers = Array.from(users.values())
-		.sort((a, b) => (b.requests ?? 0) - (a.requests ?? 0))
-		.slice(0, 5)
-		.map((u, idx) => {
-			const label = formatUserLabel(u)
-			const count = u.requests ?? 0
-			return `${idx + 1}. ${label} (id: ${u.id}) — ${count}`
-		})
+	const snapshot = await buildUserStatsSnapshot()
+	const topUsers = snapshot.topUsers.slice(0, 5).map((u, idx) => {
+		return `${idx + 1}. ${u.label} (id: ${u.id}) — ${u.requests}`
+	})
 
 	const lines = [
 		bold("Stats"),
-		`Users: ${users.size}`,
-		`Banned: ${bans.size}`,
-		`Active 24h: ${active24h}`,
-		`Active 7d: ${active7d}`,
-		`Active 30d: ${active30d}`,
-		`Requests total: ${totalRequests}`,
-		`Downloads total: ${totalDownloads}`,
+		`Users: ${snapshot.usersTotal}`,
+		`Banned: ${snapshot.bannedTotal}`,
+		`Active 24h: ${snapshot.active24h}`,
+		`Active 7d: ${snapshot.active7d}`,
+		`Active 30d: ${snapshot.active30d}`,
+		`Requests total: ${snapshot.requestsTotal}`,
+		`Downloads total: ${snapshot.downloadsTotal}`,
 		"",
 		bold("Top users by requests"),
 		topUsers.length ? topUsers.join("\n") : "—",
 	]
 
 	await ctx.reply(lines.join("\n"), { parse_mode: "HTML" })
+})
+
+server.get("/admin/stats.json", requireDashboardAuth, async (_req, res) => {
+	try {
+		const snapshot = await buildUserStatsSnapshot()
+		res.json(snapshot)
+	} catch (error) {
+		console.error("Failed to build stats snapshot:", error)
+		res.status(500).json({ error: "Failed to build stats snapshot" })
+	}
+})
+
+server.get("/admin/stats", requireDashboardAuth, async (_req, res) => {
+	try {
+		const snapshot = await buildUserStatsSnapshot()
+		const rows = snapshot.topUsers
+			.map((u, index) => {
+				const lastSeen = u.lastSeen ? escapeHtml(u.lastSeen) : "—"
+				return `
+          <tr>
+            <td>${index + 1}</td>
+            <td>${escapeHtml(u.label)}</td>
+            <td>${u.id}</td>
+            <td>${u.requests}</td>
+            <td>${u.downloads}</td>
+            <td>${lastSeen}</td>
+          </tr>
+        `
+			})
+			.join("")
+
+		const html = `
+      <!doctype html>
+      <html lang="ru">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>User Stats</title>
+          <style>
+            :root {
+              color-scheme: light;
+              --bg: #f4f5f7;
+              --card: #ffffff;
+              --text: #101828;
+              --muted: #667085;
+              --accent: #0f7b6c;
+              --border: #e4e7ec;
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+              background: linear-gradient(135deg, #eef2f3 0%, #e7ecef 40%, #f4f5f7 100%);
+              color: var(--text);
+            }
+            header {
+              padding: 28px 32px 12px;
+            }
+            h1 {
+              margin: 0 0 6px;
+              font-size: 28px;
+              letter-spacing: -0.01em;
+            }
+            .meta {
+              color: var(--muted);
+              font-size: 14px;
+            }
+            .container {
+              padding: 0 32px 32px;
+              display: grid;
+              gap: 16px;
+            }
+            .cards {
+              display: grid;
+              gap: 12px;
+              grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            }
+            .card {
+              background: var(--card);
+              border: 1px solid var(--border);
+              border-radius: 14px;
+              padding: 16px;
+              box-shadow: 0 4px 12px rgba(16, 24, 40, 0.06);
+            }
+            .card h3 {
+              margin: 0 0 6px;
+              font-size: 12px;
+              letter-spacing: 0.08em;
+              text-transform: uppercase;
+              color: var(--muted);
+            }
+            .card .value {
+              font-size: 26px;
+              font-weight: 600;
+              color: var(--text);
+            }
+            .table-wrap {
+              background: var(--card);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              padding: 8px 16px 16px;
+              overflow-x: auto;
+              box-shadow: 0 6px 16px rgba(16, 24, 40, 0.08);
+            }
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              font-size: 14px;
+            }
+            th, td {
+              padding: 12px 8px;
+              border-bottom: 1px solid var(--border);
+              text-align: left;
+              white-space: nowrap;
+            }
+            th {
+              font-size: 12px;
+              text-transform: uppercase;
+              letter-spacing: 0.06em;
+              color: var(--muted);
+            }
+            tbody tr:hover {
+              background: #f8fafc;
+            }
+            .pill {
+              display: inline-block;
+              padding: 2px 8px;
+              background: rgba(15, 123, 108, 0.1);
+              color: var(--accent);
+              border-radius: 999px;
+              font-weight: 600;
+              font-size: 12px;
+            }
+            @media (max-width: 640px) {
+              header, .container { padding: 20px; }
+              h1 { font-size: 22px; }
+            }
+          </style>
+        </head>
+        <body>
+          <header>
+            <h1>User Stats</h1>
+            <div class="meta">Обновлено: ${escapeHtml(snapshot.generatedAt)}</div>
+          </header>
+          <div class="container">
+            <div class="cards">
+              <div class="card">
+                <h3>Всего пользователей</h3>
+                <div class="value">${snapshot.usersTotal}</div>
+              </div>
+              <div class="card">
+                <h3>Забанено</h3>
+                <div class="value">${snapshot.bannedTotal}</div>
+              </div>
+              <div class="card">
+                <h3>Активны 24h</h3>
+                <div class="value">${snapshot.active24h}</div>
+              </div>
+              <div class="card">
+                <h3>Активны 7d</h3>
+                <div class="value">${snapshot.active7d}</div>
+              </div>
+              <div class="card">
+                <h3>Активны 30d</h3>
+                <div class="value">${snapshot.active30d}</div>
+              </div>
+              <div class="card">
+                <h3>Requests</h3>
+                <div class="value">${snapshot.requestsTotal}</div>
+              </div>
+              <div class="card">
+                <h3>Downloads</h3>
+                <div class="value">${snapshot.downloadsTotal}</div>
+              </div>
+              <div class="card">
+                <h3>Top users</h3>
+                <div class="value"><span class="pill">Top ${snapshot.topUsers.length}</span></div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>User</th>
+                    <th>ID</th>
+                    <th>Requests</th>
+                    <th>Downloads</th>
+                    <th>Last seen</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows || "<tr><td colspan=\"6\">Нет данных</td></tr>"}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </body>
+      </html>
+    `
+
+		res.setHeader("Content-Type", "text/html; charset=utf-8")
+		res.send(html)
+	} catch (error) {
+		console.error("Failed to render stats dashboard:", error)
+		res.status(500).send("Failed to render stats dashboard")
+	}
+})
+
+server.get("/admin/users.json", requireDashboardAuth, async (_req, res) => {
+	try {
+		const usersList = await buildUserList()
+		res.json({
+			generatedAt: new Date().toISOString(),
+			total: usersList.length,
+			users: usersList,
+		})
+	} catch (error) {
+		console.error("Failed to build users list:", error)
+		res.status(500).json({ error: "Failed to build users list" })
+	}
+})
+
+server.get("/admin/users", requireDashboardAuth, async (_req, res) => {
+	try {
+		const usersList = await buildUserList()
+		const rows = usersList
+			.map((u, index) => {
+				const lastSeen = u.lastSeen ? escapeHtml(u.lastSeen) : "—"
+				const name = escapeHtml(u.label)
+				const username = u.username ? `@${escapeHtml(u.username)}` : "—"
+				return `
+          <tr>
+            <td>${index + 1}</td>
+            <td>${name}</td>
+            <td>${username}</td>
+            <td>${u.id}</td>
+            <td>${u.requests}</td>
+            <td>${u.downloads}</td>
+            <td>${lastSeen}</td>
+          </tr>
+        `
+			})
+			.join("")
+
+		const html = `
+      <!doctype html>
+      <html lang="ru">
+        <head>
+          <meta charset="utf-8" />
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Users</title>
+          <style>
+            :root {
+              color-scheme: light;
+              --bg: #f4f5f7;
+              --card: #ffffff;
+              --text: #101828;
+              --muted: #667085;
+              --accent: #0f7b6c;
+              --border: #e4e7ec;
+            }
+            * { box-sizing: border-box; }
+            body {
+              margin: 0;
+              font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+              background: linear-gradient(135deg, #eef2f3 0%, #e7ecef 40%, #f4f5f7 100%);
+              color: var(--text);
+            }
+            header {
+              padding: 28px 32px 12px;
+            }
+            h1 {
+              margin: 0 0 6px;
+              font-size: 28px;
+              letter-spacing: -0.01em;
+            }
+            .meta {
+              color: var(--muted);
+              font-size: 14px;
+            }
+            .container {
+              padding: 0 32px 32px;
+              display: grid;
+              gap: 16px;
+            }
+            .table-wrap {
+              background: var(--card);
+              border: 1px solid var(--border);
+              border-radius: 16px;
+              padding: 8px 16px 16px;
+              overflow-x: auto;
+              box-shadow: 0 6px 16px rgba(16, 24, 40, 0.08);
+            }
+            table {
+              width: 100%;
+              border-collapse: collapse;
+              font-size: 14px;
+            }
+            th, td {
+              padding: 12px 8px;
+              border-bottom: 1px solid var(--border);
+              text-align: left;
+              white-space: nowrap;
+            }
+            th {
+              font-size: 12px;
+              text-transform: uppercase;
+              letter-spacing: 0.06em;
+              color: var(--muted);
+            }
+            tbody tr:hover {
+              background: #f8fafc;
+            }
+            @media (max-width: 640px) {
+              header, .container { padding: 20px; }
+              h1 { font-size: 22px; }
+            }
+          </style>
+        </head>
+        <body>
+          <header>
+            <h1>Users</h1>
+            <div class="meta">Всего: ${usersList.length}</div>
+          </header>
+          <div class="container">
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>User</th>
+                    <th>Username</th>
+                    <th>ID</th>
+                    <th>Requests</th>
+                    <th>Downloads</th>
+                    <th>Last seen</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rows || "<tr><td colspan=\"7\">Нет данных</td></tr>"}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </body>
+      </html>
+    `
+
+		res.setHeader("Content-Type", "text/html; charset=utf-8")
+		res.send(html)
+	} catch (error) {
+		console.error("Failed to render users list:", error)
+		res.status(500).send("Failed to render users list")
+	}
+})
+
+server.get("/admin/users/:id/links.json", requireDashboardAuth, async (req, res) => {
+	try {
+		const userId = Number.parseInt(req.params.id, 10)
+		if (!Number.isFinite(userId)) {
+			res.status(400).json({ error: "Invalid user id" })
+			return
+		}
+		const links = await getUserLinks(userId)
+		res.json({ userId, total: links.length, links })
+	} catch (error) {
+		console.error("Failed to get user links:", error)
+		res.status(500).json({ error: "Failed to get user links" })
+	}
+})
+
+server.get("/admin/links.json", requireDashboardAuth, async (req, res) => {
+	try {
+		const limit = Number.parseInt(String(req.query.limit || "200"), 10)
+		const safeLimit = Number.isFinite(limit) ? Math.min(Math.max(limit, 1), 1000) : 200
+		const links = await getAllLinks()
+		res.json({ total: links.length, links: links.slice(0, safeLimit) })
+	} catch (error) {
+		console.error("Failed to get links:", error)
+		res.status(500).json({ error: "Failed to get links" })
+	}
+})
+
+server.get("/admin/errors.json", requireDashboardAuth, async (_req, res) => {
+	try {
+		await loadErrorLogs()
+		res.json({ total: errorLogs.length, errors: errorLogs })
+	} catch (error) {
+		console.error("Failed to load error logs:", error)
+		res.status(500).json({ error: "Failed to load error logs" })
+	}
+})
+
+server.get("/admin/system.json", requireDashboardAuth, (_req, res) => {
+	try {
+		const totalMem = os.totalmem()
+		const freeMem = os.freemem()
+		const usedMem = totalMem - freeMem
+		const load = os.loadavg()
+		res.json({
+			uptime: os.uptime(),
+			load1: load[0],
+			load5: load[1],
+			load15: load[2],
+			memoryTotal: totalMem,
+			memoryFree: freeMem,
+			memoryUsed: usedMem,
+			processRss: process.memoryUsage().rss,
+		})
+	} catch (error) {
+		console.error("Failed to build system stats:", error)
+		res.status(500).json({ error: "Failed to build system stats" })
+	}
+})
+
+server.get("/admin/system-history.json", requireDashboardAuth, async (req, res) => {
+	try {
+		await loadSystemHistory()
+		const hoursParam = req.query.hours ? Number(req.query.hours) : undefined
+		const periodHours =
+			Number.isFinite(hoursParam) && hoursParam && hoursParam > 0
+				? Math.min(hoursParam, 168)
+				: 24
+		const cutoff = Date.now() - periodHours * 60 * 60 * 1000
+		const samples = systemHistory.filter(
+			(item) => Date.parse(item.at) >= cutoff,
+		)
+		res.json({ periodHours, total: samples.length, samples })
+	} catch (error) {
+		console.error("Failed to build system history:", error)
+		res.status(500).json({ error: "Failed to build system history" })
+	}
+})
+
+server.get("/admin/logout", (_req, res) => {
+	res.setHeader("WWW-Authenticate", "Basic realm=\"Yakachokbot Admin\"")
+	res.status(401).send("Logged out")
+})
+
+server.get("/admin/activity.json", requireDashboardAuth, async (_req, res) => {
+	try {
+		try {
+			const raw = await readFile(ACTIVITY_FILE, "utf-8")
+			const data = JSON.parse(raw)
+			res.json(data)
+			return
+		} catch {}
+		const jobs = Array.from(jobMeta.values()).map((job) => ({
+			id: job.id,
+			userId: job.userId,
+			url: job.url,
+			state: job.state,
+		}))
+		res.json({
+			updatedAt: new Date().toISOString(),
+			pending: queue.getPendingCount(),
+			active: queue.getActiveCount(),
+			jobs,
+		})
+	} catch (error) {
+		console.error("Failed to build activity data:", error)
+		res.status(500).json({ error: "Failed to build activity data" })
+	}
+})
+
+server.post("/admin/users/:id/ban", requireDashboardAuth, async (req, res) => {
+	try {
+		const userId = Number.parseInt(req.params.id, 10)
+		if (!Number.isFinite(userId)) {
+			res.status(400).json({ error: "Invalid user id" })
+			return
+		}
+		const reason = typeof req.body?.reason === "string" ? req.body.reason : ""
+		await loadBans()
+		bans.set(userId, {
+			id: userId,
+			at: Date.now(),
+			by: ADMIN_ID,
+			reason: reason || undefined,
+		})
+		await saveBans()
+		res.json({ ok: true })
+	} catch (error) {
+		console.error("Failed to ban user:", error)
+		res.status(500).json({ error: "Failed to ban user" })
+	}
+})
+
+server.post("/admin/users/:id/unban", requireDashboardAuth, async (req, res) => {
+	try {
+		const userId = Number.parseInt(req.params.id, 10)
+		if (!Number.isFinite(userId)) {
+			res.status(400).json({ error: "Invalid user id" })
+			return
+		}
+		await loadBans()
+		bans.delete(userId)
+		await saveBans()
+		res.json({ ok: true })
+	} catch (error) {
+		console.error("Failed to unban user:", error)
+		res.status(500).json({ error: "Failed to unban user" })
+	}
+})
+
+server.post("/admin/users/:id/cancel", requireDashboardAuth, async (req, res) => {
+	try {
+		const userId = Number.parseInt(req.params.id, 10)
+		if (!Number.isFinite(userId)) {
+			res.status(400).json({ error: "Invalid user id" })
+			return
+		}
+		const removedRequests = cancelUserRequests(userId)
+		const { removedCount, activeCancelled, remainingActive } = cancelUserJobs(userId)
+		res.json({ ok: true, removedCount, activeCancelled, remainingActive, removedRequests })
+	} catch (error) {
+		console.error("Failed to cancel user jobs:", error)
+		res.status(500).json({ error: "Failed to cancel user jobs" })
+	}
+})
+
+server.get("/admin", requireDashboardAuth, async (_req, res) => {
+	const html = `
+    <!doctype html>
+    <html lang="ru">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>Admin Panel</title>
+        <style>
+          :root {
+            color-scheme: light;
+            --bg: #f4f5f7;
+            --card: #ffffff;
+            --text: #101828;
+            --muted: #667085;
+            --accent: #0f7b6c;
+            --border: #e4e7ec;
+            --danger: #b42318;
+          }
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+            background: linear-gradient(135deg, #eef2f3 0%, #e7ecef 40%, #f4f5f7 100%);
+            color: var(--text);
+          }
+          header {
+            padding: 24px 32px 12px;
+          }
+          h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: -0.01em; }
+          .meta { color: var(--muted); font-size: 14px; }
+          .container { padding: 0 32px 32px; display: grid; gap: 16px; }
+          .tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+          .tab-btn {
+            border: 1px solid var(--border);
+            background: var(--card);
+            padding: 8px 12px;
+            border-radius: 999px;
+            cursor: pointer;
+            font-weight: 600;
+            color: var(--muted);
+          }
+          .tab-btn.active { color: var(--accent); border-color: rgba(15,123,108,0.4); }
+          .panel { display: none; }
+          .panel.active { display: block; }
+          .cards {
+            display: grid;
+            gap: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+          }
+          .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 16px;
+            box-shadow: 0 4px 12px rgba(16, 24, 40, 0.06);
+          }
+          .card h3 { margin: 0 0 6px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+          .card .value { font-size: 24px; font-weight: 600; }
+          .table-wrap {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 8px 16px 16px;
+            overflow-x: auto;
+            box-shadow: 0 6px 16px rgba(16, 24, 40, 0.08);
+          }
+            table { width: 100%; border-collapse: collapse; font-size: 14px; table-layout: fixed; }
+            th, td { padding: 10px 8px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+            th[data-sort], th { overflow: hidden; text-overflow: ellipsis; }
+            td { overflow: hidden; text-overflow: ellipsis; }
+          th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+          tbody tr:hover { background: #f8fafc; }
+          .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+          .btn {
+            border: 1px solid var(--border);
+            background: #fff;
+            padding: 6px 10px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+          }
+          .btn.danger { color: var(--danger); border-color: rgba(180,35,24,0.4); }
+          .btn.primary { color: var(--accent); border-color: rgba(15,123,108,0.4); }
+          .search { padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; min-width: 220px; }
+          .pager { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+          .pager select { padding: 6px 8px; border-radius: 10px; border: 1px solid var(--border); }
+          .pagination { display: flex; gap: 6px; flex-wrap: wrap; }
+          .pagination .page-btn {
+            border: 1px solid var(--border);
+            background: #fff;
+            padding: 4px 8px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+          }
+          .pagination .page-btn.active {
+            border-color: rgba(15,123,108,0.4);
+            color: var(--accent);
+            font-weight: 700;
+          }
+          tr.highlight {
+            background: rgba(15, 123, 108, 0.12) !important;
+          }
+          .chart-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 12px 16px 16px;
+            box-shadow: 0 6px 16px rgba(16, 24, 40, 0.08);
+          }
+          .chart-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 8px;
+          }
+          .chart-legend {
+            display: flex;
+            gap: 10px;
+            font-size: 12px;
+            color: var(--muted);
+          }
+          .chart-controls { display: flex; gap: 6px; flex-wrap: wrap; }
+          .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+          .legend-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+          @media (max-width: 640px) {
+            header, .container { padding: 20px; }
+            h1 { font-size: 22px; }
+          }
+        </style>
+      </head>
+      <body>
+          <header>
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+              <div>
+                <h1 data-i18n="title">Admin Panel</h1>
+                <div class="meta" id="meta" data-i18n="loading">Загрузка…</div>
+              </div>
+              <div class="actions">
+                <select class="btn" id="lang-select">
+                  <option value="ru">RUS</option>
+                  <option value="en">ENG</option>
+                </select>
+                <button class="btn" id="logout-btn" data-i18n="logout">Выйти</button>
+              </div>
+            </div>
+          </header>
+        <div class="container">
+          <div class="tabs">
+            <button class="tab-btn active" data-tab="stats" data-i18n="tabStats">Статистика</button>
+            <button class="tab-btn" data-tab="users" data-i18n="tabUsers">Пользователи</button>
+            <button class="tab-btn" data-tab="links" data-i18n="tabLinks">История загрузок</button>
+            <button class="tab-btn" data-tab="errors" data-i18n="tabErrors">Ошибки</button>
+          </div>
+
+          <section class="panel active" id="panel-stats">
+            <div class="cards" id="stats-cards"></div>
+            <div class="cards" id="system-cards" style="margin-top:12px;"></div>
+            <div class="chart-card" style="margin-top:12px;">
+              <div class="chart-header">
+                <strong data-i18n="chartTitle">Server load</strong>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                  <div class="chart-controls">
+                    <button class="btn" data-range="1" data-i18n="range1h">1ч</button>
+                    <button class="btn" data-range="6" data-i18n="range6h">6ч</button>
+                    <button class="btn" data-range="24" data-i18n="range24h">24ч</button>
+                    <button class="btn" data-range="168" data-i18n="range7d">7д</button>
+                  </div>
+                  <div class="chart-legend">
+                    <span class="legend-item"><span class="legend-dot" style="background:#0f7b6c;"></span><span data-i18n="chartLoad">Load 1m</span></span>
+                    <span class="legend-item"><span class="legend-dot" style="background:#f39c12;"></span><span data-i18n="chartMem">Memory %</span></span>
+                  </div>
+                </div>
+              </div>
+              <canvas id="load-chart" height="120"></canvas>
+            </div>
+            <div class="actions" style="margin:14px 0 8px;">
+              <div class="pager">
+                <label data-i18n="rows">Rows:</label>
+                <select id="perpage-activity">
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                <div class="pagination" id="pagination-activity"></div>
+              </div>
+            </div>
+            <div class="table-wrap" style="margin-top:16px;">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:120px;" data-table="activity" data-sort="userId" data-type="number" data-i18n="colUser">User</th>
+                    <th style="width:120px;" data-table="activity" data-sort="state" data-i18n="colState">State</th>
+                    <th style="width:70%;" data-table="activity" data-sort="url" data-i18n="colUrl">URL</th>
+                  </tr>
+                </thead>
+                <tbody id="activity-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" id="panel-users">
+            <div class="actions" style="margin-bottom:10px;">
+              <input class="search" id="user-search" data-i18n-placeholder="searchUsers" placeholder="Поиск по имени, username или id" />
+              <div class="pager">
+                <label data-i18n="rows">Rows:</label>
+                <select id="perpage-users">
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                <div class="pagination" id="pagination-users"></div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:22%;" data-table="users" data-sort="label" data-i18n="colUser">User</th>
+                    <th style="width:16%;" data-table="users" data-sort="username" data-i18n="colUsername">Username</th>
+                    <th style="width:110px;" data-table="users" data-sort="id" data-type="number" data-i18n="colId">ID</th>
+                    <th style="width:110px;" data-table="users" data-sort="requests" data-type="number" data-i18n="colRequests">Requests</th>
+                    <th style="width:120px;" data-table="users" data-sort="downloads" data-type="number" data-i18n="colDownloads">Downloads</th>
+                    <th style="width:160px;" data-table="users" data-sort="lastSeen" data-type="date" data-i18n="colLastSeen">Last seen</th>
+                    <th style="width:90px;" data-table="users" data-sort="banned" data-type="boolean" data-i18n="colStatus">Status</th>
+                    <th style="width:220px;" data-i18n="colActions">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="users-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" id="panel-links">
+            <div class="actions" style="margin-bottom:10px;">
+              <input class="search" id="links-user-id" data-i18n-placeholder="userIdOptional" placeholder="User ID (optional)" />
+              <button class="btn primary" id="load-links" data-i18n="show">Показать</button>
+              <div class="pager">
+                <label data-i18n="rows">Rows:</label>
+                <select id="perpage-links">
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                <div class="pagination" id="pagination-links"></div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:160px;" data-table="links" data-sort="at" data-type="date" data-i18n="colTime">Time</th>
+                    <th style="width:120px;" data-table="links" data-sort="userId" data-type="number" data-i18n="colUser">User</th>
+                    <th style="width:120px;" data-table="links" data-sort="status" data-i18n="colStatus">Status</th>
+                    <th style="width:40%;" data-table="links" data-sort="url" data-i18n="colUrl">URL</th>
+                    <th style="width:25%;" data-table="links" data-sort="error" data-i18n="colError">Error</th>
+                  </tr>
+                </thead>
+                <tbody id="links-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel" id="panel-errors">
+            <div class="actions" style="margin-bottom:10px;">
+              <div class="pager">
+                <label data-i18n="rows">Rows:</label>
+                <select id="perpage-errors">
+                  <option value="10">10</option>
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                <div class="pagination" id="pagination-errors"></div>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width:60px;">#</th>
+                    <th style="width:160px;" data-table="errors" data-sort="at" data-type="date" data-i18n="colTime">Time</th>
+                    <th style="width:120px;" data-table="errors" data-sort="userId" data-type="number" data-i18n="colUser">User</th>
+                    <th style="width:25%;" data-table="errors" data-sort="context" data-i18n="colContext">Context</th>
+                    <th style="width:45%;" data-table="errors" data-sort="error" data-i18n="colError">Error</th>
+                  </tr>
+                </thead>
+                <tbody id="errors-body"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+
+        <script>
+          const byId = (id) => document.getElementById(id);
+          const meta = byId('meta');
+          const tabs = document.querySelectorAll('.tab-btn');
+          const panels = {
+            stats: byId('panel-stats'),
+            users: byId('panel-users'),
+            links: byId('panel-links'),
+            errors: byId('panel-errors'),
+          };
+          tabs.forEach(btn => btn.addEventListener('click', () => {
+            tabs.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            Object.values(panels).forEach(p => p.classList.remove('active'));
+            panels[btn.dataset.tab].classList.add('active');
+            if (btn.dataset.tab === 'links') {
+              const value = byId('links-user-id').value.trim();
+              loadLinks(value);
+            }
+          }));
+
+          const fmtTime = (iso) => {
+            if (!iso) return '—';
+            const d = new Date(iso);
+            const pad = (v) => String(v).padStart(2, '0');
+            const hh = pad(d.getHours());
+            const mm = pad(d.getMinutes());
+            const dd = pad(d.getDate());
+            const month = pad(d.getMonth() + 1);
+            const yyyy = d.getFullYear();
+            return hh + '-' + mm + '--' + dd + '-' + month + '-' + yyyy;
+          };
+          const fmtBytes = (value) => {
+            if (!Number.isFinite(value)) return '—';
+            const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+            let v = value;
+            let idx = 0;
+            while (v >= 1024 && idx < units.length - 1) {
+              v /= 1024;
+              idx++;
+            }
+            return v.toFixed(1) + ' ' + units[idx];
+          };
+          const fmtUptime = (seconds) => {
+            if (!Number.isFinite(seconds)) return '—';
+            const s = Math.floor(seconds);
+            const days = Math.floor(s / 86400);
+            const hours = Math.floor((s % 86400) / 3600);
+            const mins = Math.floor((s % 3600) / 60);
+            return (days ? days + 'd ' : '') + hours + 'h ' + mins + 'm';
+          };
+          const escapeHtml = (val) => String(val ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          const state = { users: [], links: [], errors: [], activity: [] };
+          const sortState = {};
+          const pageState = {
+            users: { page: 1, perPage: 10 },
+            links: { page: 1, perPage: 10 },
+            errors: { page: 1, perPage: 10 },
+            activity: { page: 1, perPage: 10 },
+          };
+          const chartState = {
+            load: [],
+            mem: [],
+            maxPoints: 240,
+          };
+          let historyHours = 24;
+          const i18n = {
+            ru: {
+              title: 'Admin Panel',
+              loading: 'Загрузка…',
+              logout: 'Выйти',
+              tabStats: 'Статистика',
+              tabUsers: 'Пользователи',
+              tabLinks: 'История загрузок',
+              tabErrors: 'Ошибки',
+              rows: 'Строк:',
+              chartTitle: 'Загрузка сервера',
+              chartLoad: 'Нагрузка 1м',
+              chartMem: 'Память %',
+              range1h: '1ч',
+              range6h: '6ч',
+              range24h: '24ч',
+              range7d: '7д',
+              colUser: 'Пользователь',
+              colUsername: 'Username',
+              colId: 'ID',
+              colRequests: 'Запросы',
+              colDownloads: 'Загрузки',
+              colLastSeen: 'Последняя активность',
+              colStatus: 'Статус',
+              colActions: 'Действия',
+              colTime: 'Время',
+              colUrl: 'Ссылка',
+              colError: 'Ошибка',
+              colContext: 'Контекст',
+              colState: 'Состояние',
+              show: 'Показать',
+              searchUsers: 'Поиск по имени, username или id',
+              userIdOptional: 'User ID (необязательно)',
+              statusOk: 'OK',
+              statusBanned: 'BANNED',
+              btnBan: 'Бан',
+              btnUnban: 'Разбан',
+              btnLinks: 'Ссылки',
+              btnCancel: 'Освободить',
+              emptyLinks: 'Нет данных',
+              emptyErrors: 'Нет данных',
+              emptyActivity: 'Нет активных задач',
+              promptReason: 'Причина (необязательно):',
+              cardUsers: 'Пользователи',
+              cardBanned: 'Заблокированы',
+              cardActive24: 'Активны 24ч',
+              cardActive7: 'Активны 7д',
+              cardActive30: 'Активны 30д',
+              cardRequests: 'Запросы',
+              cardDownloads: 'Загрузки',
+              cardQueuePending: 'Очередь (ожид.)',
+              cardQueueActive: 'Очередь (в работе)',
+              cardActiveJobs: 'Активные задачи',
+              cardActiveUsers: 'Активные пользователи',
+              sysLoad1: 'Нагрузка 1м',
+              sysLoad5: 'Нагрузка 5м',
+              sysLoad15: 'Нагрузка 15м',
+              sysMemUsed: 'Память (исп.)',
+              sysMemFree: 'Память (своб.)',
+              sysMemTotal: 'Память (всего)',
+              sysUptime: 'Аптайм',
+              sysRss: 'RSS процесса',
+            },
+            en: {
+              title: 'Admin Panel',
+              loading: 'Loading…',
+              logout: 'Logout',
+              tabStats: 'Stats',
+              tabUsers: 'Users',
+              tabLinks: 'Download history',
+              tabErrors: 'Errors',
+              rows: 'Rows:',
+              chartTitle: 'Server load',
+              chartLoad: 'Load 1m',
+              chartMem: 'Memory %',
+              range1h: '1h',
+              range6h: '6h',
+              range24h: '24h',
+              range7d: '7d',
+              colUser: 'User',
+              colUsername: 'Username',
+              colId: 'ID',
+              colRequests: 'Requests',
+              colDownloads: 'Downloads',
+              colLastSeen: 'Last seen',
+              colStatus: 'Status',
+              colActions: 'Actions',
+              colTime: 'Time',
+              colUrl: 'URL',
+              colError: 'Error',
+              colContext: 'Context',
+              colState: 'State',
+              show: 'Show',
+              searchUsers: 'Search by name, username or id',
+              userIdOptional: 'User ID (optional)',
+              statusOk: 'OK',
+              statusBanned: 'BANNED',
+              btnBan: 'Ban',
+              btnUnban: 'Unban',
+              btnLinks: 'Links',
+              btnCancel: 'Cancel',
+              emptyLinks: 'No data',
+              emptyErrors: 'No data',
+              emptyActivity: 'No active jobs',
+              promptReason: 'Reason (optional):',
+              cardUsers: 'Users',
+              cardBanned: 'Banned',
+              cardActive24: 'Active 24h',
+              cardActive7: 'Active 7d',
+              cardActive30: 'Active 30d',
+              cardRequests: 'Requests',
+              cardDownloads: 'Downloads',
+              cardQueuePending: 'Queue pending',
+              cardQueueActive: 'Queue active',
+              cardActiveJobs: 'Active jobs',
+              cardActiveUsers: 'Active users',
+              sysLoad1: 'Load 1m',
+              sysLoad5: 'Load 5m',
+              sysLoad15: 'Load 15m',
+              sysMemUsed: 'Memory used',
+              sysMemFree: 'Memory free',
+              sysMemTotal: 'Memory total',
+              sysUptime: 'Uptime',
+              sysRss: 'Process RSS',
+            },
+          };
+          let lang = 'ru';
+
+          const getValue = (row, key) => row?.[key];
+          const sortList = (list, key, type, dir) => {
+            const sign = dir === 'desc' ? -1 : 1;
+            return [...list].sort((a, b) => {
+              const av = getValue(a, key);
+              const bv = getValue(b, key);
+              if (type === 'number') return sign * ((Number(av) || 0) - (Number(bv) || 0));
+              if (type === 'date') return sign * ((Date.parse(av || '') || 0) - (Date.parse(bv || '') || 0));
+              if (type === 'boolean') return sign * ((av ? 1 : 0) - (bv ? 1 : 0));
+              return sign * String(av ?? '').localeCompare(String(bv ?? ''), 'ru');
+            });
+          };
+
+          const paginate = (list, table) => {
+            const { page, perPage } = pageState[table];
+            const total = list.length;
+            const pages = Math.max(1, Math.ceil(total / perPage));
+            const safePage = Math.min(Math.max(1, page), pages);
+            const start = (safePage - 1) * perPage;
+            const slice = list.slice(start, start + perPage);
+            pageState[table].page = safePage;
+            return { slice, total, pages, page: safePage };
+          };
+
+          const renderPagination = (table, pages, page) => {
+            const container = byId('pagination-' + table);
+            if (!container) return;
+            if (pages <= 1) {
+              container.innerHTML = '';
+              return;
+            }
+            const buttons = [];
+            const makeBtn = (label, p, active=false) =>
+              '<button class=\"page-btn'+(active?' active':'')+'\" data-table=\"'+table+'\" data-page=\"'+p+'\">'+label+'</button>';
+            buttons.push(makeBtn('«', 1));
+            buttons.push(makeBtn('‹', Math.max(1, page - 1)));
+            const start = Math.max(1, page - 2);
+            const end = Math.min(pages, page + 2);
+            for (let p = start; p <= end; p++) {
+              buttons.push(makeBtn(String(p), p, p === page));
+            }
+            buttons.push(makeBtn('›', Math.min(pages, page + 1)));
+            buttons.push(makeBtn('»', pages));
+            container.innerHTML = buttons.join('');
+          };
+
+          const t = (key) => (i18n[lang] && i18n[lang][key]) || key;
+          const applyI18n = () => {
+            document.querySelectorAll('[data-i18n]').forEach(el => {
+              const key = el.getAttribute('data-i18n');
+              if (key) el.textContent = t(key);
+            });
+            document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+              const key = el.getAttribute('data-i18n-placeholder');
+              if (key) el.setAttribute('placeholder', t(key));
+            });
+          };
+
+          let selectedUserId = null;
+
+          const renderUsers = (list) => {
+            const { slice, pages, page } = paginate(list, 'users');
+            renderPagination('users', pages, page);
+            byId('users-body').innerHTML = slice.map((u, i) => {
+              const statusLabel = u.banned ? t('statusBanned') : t('statusOk');
+              const isSelected = selectedUserId && Number(selectedUserId) === Number(u.id);
+              return '<tr>' +
+                '<td>'+((page - 1) * pageState.users.perPage + i + 1)+'</td>' +
+                '<td>'+escapeHtml(u.label)+'</td>' +
+                '<td>'+(u.username ? '@'+escapeHtml(u.username) : '—')+'</td>' +
+                '<td>'+u.id+'</td>' +
+                '<td>'+u.requests+'</td>' +
+                '<td>'+u.downloads+'</td>' +
+                '<td>'+fmtTime(u.lastSeen)+'</td>' +
+                '<td>'+statusLabel+'</td>' +
+                '<td>' +
+                  '<div class=\"actions\">' +
+                    (u.banned
+                      ? '<button class=\"btn primary\" data-action=\"unban\" data-id=\"'+u.id+'\">'+t('btnUnban')+'</button>'
+                      : '<button class=\"btn danger\" data-action=\"ban\" data-id=\"'+u.id+'\">'+t('btnBan')+'</button>') +
+                    '<button class=\"btn\" data-action=\"links\" data-id=\"'+u.id+'\">'+t('btnLinks')+'</button>' +
+                    '<button class=\"btn\" data-action=\"cancel\" data-id=\"'+u.id+'\">'+t('btnCancel')+'</button>' +
+                  '</div>' +
+                '</td>' +
+                '</tr>';
+            }).join('');
+            if (selectedUserId) {
+              const rows = byId('users-body').querySelectorAll('tr');
+              rows.forEach((row, idx) => {
+                const item = slice[idx];
+                if (item && Number(item.id) === Number(selectedUserId)) {
+                  row.classList.add('highlight');
+                }
+              });
+            }
+          };
+
+          const renderLinks = (list) => {
+            const { slice, pages, page } = paginate(list, 'links');
+            renderPagination('links', pages, page);
+            byId('links-body').innerHTML = slice.map((l, i) => (
+              '<tr>' +
+                '<td>'+((page - 1) * pageState.links.perPage + i + 1)+'</td>' +
+                '<td>'+fmtTime(l.at)+'</td>' +
+                '<td>'+(l.userId ? '<button class=\"btn\" data-action=\"view-user\" data-id=\"'+l.userId+'\">'+l.userId+'</button>' : '—')+'</td>' +
+                '<td>'+escapeHtml(l.status)+'</td>' +
+                '<td>'+escapeHtml(l.url)+'</td>' +
+                '<td>'+escapeHtml(l.error || '—')+'</td>' +
+              '</tr>'
+            )).join('') || '<tr><td colspan=\"6\">'+t('emptyLinks')+'</td></tr>';
+          };
+
+          const renderErrors = (list) => {
+            const { slice, pages, page } = paginate(list, 'errors');
+            renderPagination('errors', pages, page);
+            byId('errors-body').innerHTML = slice.map((e, i) => (
+              '<tr>' +
+                '<td>'+((page - 1) * pageState.errors.perPage + i + 1)+'</td>' +
+                '<td>'+fmtTime(e.at)+'</td>' +
+                '<td>'+(e.userId ?? '—')+'</td>' +
+                '<td>'+escapeHtml(e.context || '—')+'</td>' +
+                '<td>'+escapeHtml(e.error || '—')+'</td>' +
+              '</tr>'
+            )).join('') || '<tr><td colspan=\"5\">'+t('emptyErrors')+'</td></tr>';
+          };
+
+          const renderActivity = (list) => {
+            const { slice, pages, page } = paginate(list, 'activity');
+            renderPagination('activity', pages, page);
+            byId('activity-body').innerHTML = slice.map((j, i) => (
+              '<tr>' +
+                '<td>'+((page - 1) * pageState.activity.perPage + i + 1)+'</td>' +
+                '<td>'+j.userId+'</td>' +
+                '<td>'+escapeHtml(j.state)+'</td>' +
+                '<td>'+escapeHtml(j.url)+'</td>' +
+              '</tr>'
+            )).join('') || '<tr><td colspan=\"4\">'+t('emptyActivity')+'</td></tr>';
+          };
+
+          async function loadStats() {
+            const res = await fetch('/admin/stats.json');
+            const data = await res.json();
+            meta.textContent = 'Обновлено: ' + fmtTime(data.generatedAt);
+            const cards = [
+              [t('cardUsers'), data.usersTotal],
+              [t('cardBanned'), data.bannedTotal],
+              [t('cardActive24'), data.active24h],
+              [t('cardActive7'), data.active7d],
+              [t('cardActive30'), data.active30d],
+              [t('cardRequests'), data.requestsTotal],
+              [t('cardDownloads'), data.downloadsTotal],
+              [t('cardQueuePending'), data.queuePending],
+              [t('cardQueueActive'), data.queueActive],
+              [t('cardActiveJobs'), data.activeJobs],
+              [t('cardActiveUsers'), data.activeUsers],
+            ];
+            byId('stats-cards').innerHTML = cards.map(([k,v]) => (
+              '<div class=\"card\"><h3>'+k+'</h3><div class=\"value\">'+v+'</div></div>'
+            )).join('');
+          }
+
+          const drawChart = () => {
+            const canvas = byId('load-chart');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            const width = canvas.clientWidth || canvas.width;
+            const height = canvas.height;
+            canvas.width = width;
+            ctx.clearRect(0, 0, width, height);
+            const maxLoad = Math.max(1, ...chartState.load, ...chartState.mem);
+            const padding = 10;
+            const plotW = width - padding * 2;
+            const plotH = height - padding * 2;
+            const downsample = (data) => {
+              if (data.length <= chartState.maxPoints) return data;
+              const step = Math.ceil(data.length / chartState.maxPoints);
+              const sampled = [];
+              for (let i = 0; i < data.length; i += step) {
+                sampled.push(data[i]);
+              }
+              return sampled;
+            };
+            const drawLine = (dataRaw, color) => {
+              const data = downsample(dataRaw);
+              if (!data.length) return;
+              ctx.beginPath();
+              data.forEach((val, i) => {
+                const x = padding + (i / Math.max(1, data.length - 1)) * plotW;
+                const y = padding + plotH - (val / maxLoad) * plotH;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+              });
+              ctx.strokeStyle = color;
+              ctx.lineWidth = 2;
+              ctx.stroke();
+            };
+            drawLine(chartState.load, '#0f7b6c');
+            drawLine(chartState.mem, '#f39c12');
+          };
+
+          async function loadSystem() {
+            const res = await fetch('/admin/system.json');
+            const data = await res.json();
+            const cards = [
+              [t('sysLoad1'), (data.load1 ?? 0).toFixed(2)],
+              [t('sysLoad5'), (data.load5 ?? 0).toFixed(2)],
+              [t('sysLoad15'), (data.load15 ?? 0).toFixed(2)],
+              [t('sysMemUsed'), fmtBytes(data.memoryUsed)],
+              [t('sysMemFree'), fmtBytes(data.memoryFree)],
+              [t('sysMemTotal'), fmtBytes(data.memoryTotal)],
+              [t('sysUptime'), fmtUptime(data.uptime)],
+              [t('sysRss'), fmtBytes(data.processRss)],
+            ];
+            byId('system-cards').innerHTML = cards.map(([k,v]) => (
+              '<div class=\"card\"><h3>'+k+'</h3><div class=\"value\">'+v+'</div></div>'
+            )).join('');
+          }
+
+          async function loadSystemHistory() {
+            const res = await fetch('/admin/system-history.json?hours=' + historyHours);
+            const data = await res.json();
+            const samples = data.samples || [];
+            chartState.load = samples.map(s => s.load1 ?? 0);
+            chartState.mem = samples.map(s => s.memPercent ?? 0);
+            drawChart();
+          }
+
+          async function loadUsers() {
+            const res = await fetch('/admin/users.json');
+            const data = await res.json();
+            const list = data.users || [];
+            state.users = list;
+            renderUsers(list);
+            const search = byId('user-search');
+            search.oninput = () => {
+              const q = search.value.trim().toLowerCase();
+              if (!q) return renderUsers(state.users);
+              renderUsers(state.users.filter(u => (
+                String(u.id).includes(q) ||
+                (u.label || '').toLowerCase().includes(q) ||
+                (u.username || '').toLowerCase().includes(q)
+              )));
+            };
+          }
+
+          async function loadErrors() {
+            const res = await fetch('/admin/errors.json');
+            const data = await res.json();
+            const list = data.errors || [];
+            state.errors = list;
+            renderErrors(list);
+          }
+
+          async function loadActivity() {
+            const res = await fetch('/admin/activity.json');
+            const data = await res.json();
+            const list = data.jobs || [];
+            state.activity = list;
+            renderActivity(list);
+          }
+
+          async function loadLinks(userId) {
+            const url = userId
+              ? '/admin/users/' + userId + '/links.json'
+              : '/admin/links.json';
+            const res = await fetch(url);
+            const data = await res.json();
+            const list = data.links || [];
+            state.links = list;
+            renderLinks(list);
+          }
+
+          function attachSortHandlers() {
+            document.querySelectorAll('th[data-sort]').forEach(th => {
+              th.style.cursor = 'pointer';
+              th.addEventListener('click', () => {
+                const table = th.dataset.table;
+                const key = th.dataset.sort;
+                const type = th.dataset.type || 'text';
+                if (!table || !key) return;
+                const current = sortState[table] || { key: null, dir: 'asc' };
+                const dir = current.key === key && current.dir === 'asc' ? 'desc' : 'asc';
+                sortState[table] = { key, dir };
+                const sorted = sortList(state[table] || [], key, type, dir);
+                pageState[table].page = 1;
+                if (table === 'users') renderUsers(sorted);
+                if (table === 'links') renderLinks(sorted);
+                if (table === 'errors') renderErrors(sorted);
+                if (table === 'activity') renderActivity(sorted);
+              });
+            });
+          }
+
+          async function postAction(id, action) {
+            await fetch('/admin/users/' + id + '/' + action, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({}),
+            });
+            await loadUsers();
+          }
+
+          byId('load-links').addEventListener('click', async () => {
+            const value = byId('links-user-id').value.trim();
+            pageState.links.page = 1;
+            await loadLinks(value);
+          });
+
+          byId('users-body').addEventListener('click', async (event) => {
+            const btn = event.target.closest('button');
+            if (!btn) return;
+            const id = btn.dataset.id;
+            const action = btn.dataset.action;
+            if (!id || !action) return;
+            if (action === 'links') {
+              byId('links-user-id').value = id;
+              pageState.links.page = 1;
+              await loadLinks(id);
+              tabs.forEach(b => b.classList.remove('active'));
+              document.querySelector('[data-tab=\"links\"]').classList.add('active');
+              Object.values(panels).forEach(p => p.classList.remove('active'));
+              panels.links.classList.add('active');
+              return;
+            }
+            if (action === 'ban') {
+              const reason = prompt(t('promptReason')) || '';
+              await fetch('/admin/users/' + id + '/ban', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason }),
+              });
+              await loadUsers();
+              return;
+            }
+            if (action === 'unban' || action === 'cancel') {
+              await postAction(id, action);
+            }
+          });
+
+          byId('links-body').addEventListener('click', async (event) => {
+            const btn = event.target.closest('button');
+            if (!btn) return;
+            const action = btn.dataset.action;
+            const id = btn.dataset.id;
+            if (action !== 'view-user' || !id) return;
+            selectedUserId = id;
+            const item = state.users.find(u => String(u.id) === String(id));
+            if (item) {
+              const idx = state.users.indexOf(item);
+              pageState.users.page = Math.floor(idx / pageState.users.perPage) + 1;
+            }
+            tabs.forEach(b => b.classList.remove('active'));
+            document.querySelector('[data-tab=\"users\"]').classList.add('active');
+            Object.values(panels).forEach(p => p.classList.remove('active'));
+            panels.users.classList.add('active');
+            renderUsers(state.users);
+          });
+
+          byId('logout-btn').addEventListener('click', async () => {
+            try {
+              await fetch('/admin/logout', { credentials: 'include' });
+            } catch {}
+            window.location.href = '/admin';
+          });
+
+          document.querySelectorAll('[data-range]').forEach(btn => {
+            btn.addEventListener('click', () => {
+              const next = Number(btn.getAttribute('data-range') || '24');
+              historyHours = Number.isFinite(next) ? next : 24;
+              document.querySelectorAll('[data-range]').forEach(b => b.classList.remove('active'));
+              btn.classList.add('active');
+              loadSystemHistory();
+            });
+          });
+
+          byId('lang-select').addEventListener('change', (event) => {
+            lang = event.target.value || 'ru';
+            applyI18n();
+            renderUsers(state.users);
+            renderLinks(state.links);
+            renderErrors(state.errors);
+            renderActivity(state.activity);
+            loadStats();
+            loadSystem();
+            drawChart();
+          });
+
+          ['users','links','errors','activity'].forEach(table => {
+            const select = byId('perpage-' + table);
+            if (!select) return;
+            select.value = String(pageState[table].perPage);
+            select.addEventListener('change', () => {
+              pageState[table].perPage = Number(select.value) || 10;
+              pageState[table].page = 1;
+              if (table === 'users') renderUsers(state.users);
+              if (table === 'links') renderLinks(state.links);
+              if (table === 'errors') renderErrors(state.errors);
+              if (table === 'activity') renderActivity(state.activity);
+            });
+          });
+
+          document.addEventListener('click', (event) => {
+            const btn = event.target.closest('.page-btn');
+            if (!btn) return;
+            const table = btn.dataset.table;
+            const page = Number(btn.dataset.page);
+            if (!table || !page) return;
+            pageState[table].page = page;
+            if (table === 'users') renderUsers(state.users);
+            if (table === 'links') renderLinks(state.links);
+            if (table === 'errors') renderErrors(state.errors);
+            if (table === 'activity') renderActivity(state.activity);
+          });
+
+          loadStats();
+          loadSystem();
+          loadSystemHistory();
+          loadUsers();
+          loadErrors();
+          loadActivity();
+          loadLinks('');
+          attachSortHandlers();
+          applyI18n();
+          const defaultRange = document.querySelector('[data-range=\"24\"]');
+          if (defaultRange) defaultRange.classList.add('active');
+          setInterval(loadSystem, 5000);
+          setInterval(loadSystemHistory, 60000);
+        </script>
+      </body>
+    </html>
+  `
+	res.setHeader("Content-Type", "text/html; charset=utf-8")
+	res.send(html)
 })
 
 // Handle cookies.txt upload (Admin only)
@@ -2993,6 +4904,7 @@ bot.on("message:text", async (ctx, next) => {
 			return
 		}
 		const sourceUrl = url
+		void logUserLink(userId, sourceUrl, "requested")
 
 		const lockResult = lockUserUrl(userId, sourceUrl)
 		if (!lockResult.ok) {
@@ -3025,6 +4937,7 @@ bot.on("message:text", async (ctx, next) => {
 						ctx.message?.message_thread_id,
 						ctx.message?.message_id,
 					)
+					await logUserLink(userId, sourceUrl, "success")
 					return
 				}
 			}
@@ -3046,6 +4959,7 @@ bot.on("message:text", async (ctx, next) => {
 						ctx.message?.message_thread_id,
 						ctx.message?.message_id,
 					)
+					await logUserLink(userId, sourceUrl, "success")
 					return
 				}
 			}
@@ -3118,6 +5032,12 @@ bot.on("message:text", async (ctx, next) => {
 			)
 		} catch (error) {
 			console.error("Formats error:", error)
+			await logErrorEntry({
+				userId,
+				url: sourceUrl,
+				context: "formats",
+				error: error instanceof Error ? error.message : String(error),
+			})
 			await ctx.reply("Ошибка.")
 		} finally {
 			if (!keepLock) {
@@ -3162,6 +5082,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	let processingMessage: any
 	const userId = ctx.from?.id
 	if (!userId) return
+	void logUserLink(userId, sourceUrl, "requested")
 	const lockResult = lockUserUrl(userId, sourceUrl)
 		if (!lockResult.ok) {
 			await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.", {
@@ -3210,6 +5131,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					})
 				}
 
+				await logUserLink(userId, sourceUrl, "success")
 				return true
 			}
 
@@ -3235,10 +5157,17 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 						message_thread_id: threadId,
 					})
 				}
+				await logUserLink(userId, sourceUrl, "success")
 				return true
 			}
 		} catch (error) {
 			console.error("Error resolving with cobalt", error)
+			await logErrorEntry({
+				userId,
+				url: sourceUrl,
+				context: "cobalt",
+				error: error instanceof Error ? error.message : String(error),
+			})
 		}
 	}
 
@@ -3289,6 +5218,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					threadId,
 					ctx.message.message_id,
 				)
+				await logUserLink(userId, sourceUrl, "success")
 				return
 			} else if (threadsData.error) {
 				console.error("Threads error:", threadsData.error)
@@ -3313,6 +5243,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					threadId,
 					ctx.message.message_id,
 				)
+				await logUserLink(userId, sourceUrl, "success")
 				return
 			} else if (pinterestData.error) {
 				console.error("Pinterest error:", pinterestData.error)

@@ -4,6 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"start": "tsx -r dotenv/config src/index.ts",
+		"admin": "ADMIN_ONLY=true tsx -r dotenv/config src/index.ts",
 		"dev": "tsx watch -r dotenv/config src/index.ts",
 		"build": "docker build -t yakachokbot .",
 		"format": "biome format --write . ",

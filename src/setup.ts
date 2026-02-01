@@ -16,6 +16,7 @@ import {
 } from "./environment"
 import { code, bold } from "./constants"
 import { cutoffWithNotice } from "./util"
+import { logErrorEntry } from "./error-log"
 
 export const bot = new Bot<ParseModeFlavor<Context>>(BOT_TOKEN, {
 	client: { apiRoot: API_ROOT },
@@ -43,6 +44,12 @@ bot.catch(async (err) => {
 		]
 			.filter(Boolean)
 			.join("\n\n")
+		logErrorEntry({
+			context: "bot.catch",
+			error: details,
+		}).catch((logError) => {
+			console.error("Failed to log error entry:", logError)
+		})
 		await bot.api.sendMessage(ADMIN_ID, message, { parse_mode: "HTML" })
 	} catch (error) {
 		console.error("Failed to notify admin about bot error:", error)

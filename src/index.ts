@@ -17,6 +17,7 @@ import { cookieFormatExample, mergeCookieContent } from "./cookies"
 import { deleteMessage, errorMessage, notifyAdminError } from "./bot-util"
 import { cobaltMatcher, cobaltResolver } from "./cobalt"
 import { bold, code, link, t, tiktokArgs, impersonateArgs, jsRuntimeArgs } from "./constants"
+import { getErrorLogs, logErrorEntry } from "./error-log"
 import {
 	ADMIN_ID,
 	ALLOW_GROUPS,
@@ -30,9 +31,9 @@ import {
 	ADMIN_DASHBOARD_PASSWORD,
 	COOKIE_FILE,
 	cookieArgs,
+	STORAGE_DIR,
 	BANS_FILE,
 	LINKS_FILE,
-	ERRORS_FILE,
 	ACTIVITY_FILE,
 	SYSTEM_HISTORY_FILE,
 	PROXY_FILE,
@@ -56,11 +57,22 @@ const cleanupMaxAgeHours = Number.isFinite(CLEANUP_MAX_AGE_HOURS)
 	? Math.max(1, CLEANUP_MAX_AGE_HOURS)
 	: 12
 
+const ensureStorageDir = async () => {
+	try {
+		await mkdir(STORAGE_DIR, { recursive: true })
+	} catch (error) {
+		console.error("Failed to create storage dir:", error)
+	}
+}
+
 const notifyAdminLog = async (title: string, error: unknown) => {
 	if (ADMIN_ONLY) return
 	try {
 		const details =
 			error instanceof Error ? error.stack || error.message : String(error)
+		logErrorEntry({ context: title, error: details }).catch((logError) => {
+			console.error("Failed to log error entry:", logError)
+		})
 		const message = [
 			bold(title),
 			code(cutoffWithNotice(details)),
@@ -397,10 +409,6 @@ const userLinks = new Map<number, LinkHistoryEntry[]>()
 let userLinksLoaded = false
 let userLinksSaveTimer: NodeJS.Timeout | undefined
 
-const errorLogs: ErrorLogEntry[] = []
-let errorLogsLoaded = false
-let errorLogsSaveTimer: NodeJS.Timeout | undefined
-
 let activitySaveTimer: NodeJS.Timeout | undefined
 
 const systemHistory: SystemHistoryEntry[] = []
@@ -453,15 +461,6 @@ type LinkHistoryEntry = {
 	error?: string
 }
 
-type ErrorLogEntry = {
-	id: string
-	at: string
-	userId?: number
-	url?: string
-	context?: string
-	error?: string
-}
-
 type SystemHistoryEntry = {
 	at: string
 	load1: number
@@ -484,6 +483,7 @@ const loadUsers = async () => {
 }
 
 const saveUsers = async () => {
+	await ensureStorageDir()
 	const entries: Record<string, UserProfile> = {}
 	for (const [id, profile] of users.entries()) {
 		entries[String(id)] = profile
@@ -528,6 +528,7 @@ const loadBans = async () => {
 }
 
 const saveBans = async () => {
+	await ensureStorageDir()
 	const entries: Record<string, BanEntry> = {}
 	for (const [id, entry] of bans.entries()) {
 		entries[String(id)] = entry
@@ -577,6 +578,7 @@ const loadUserLinks = async () => {
 }
 
 const saveUserLinks = async () => {
+	await ensureStorageDir()
 	const entries: Record<string, LinkHistoryEntry[]> = {}
 	for (const [id, list] of userLinks.entries()) {
 		entries[String(id)] = list
@@ -594,33 +596,8 @@ const scheduleUserLinksSave = () => {
 	}, 2000)
 }
 
-const loadErrorLogs = async () => {
-	if (errorLogsLoaded) return
-	errorLogsLoaded = true
-	try {
-		const raw = await readFile(ERRORS_FILE, "utf-8")
-		const data = JSON.parse(raw) as { errors?: ErrorLogEntry[] }
-		if (Array.isArray(data?.errors)) {
-			errorLogs.push(...data.errors)
-		}
-	} catch {}
-}
-
-const saveErrorLogs = async () => {
-	await writeFile(ERRORS_FILE, JSON.stringify({ errors: errorLogs }, null, 2))
-}
-
-const scheduleErrorLogsSave = () => {
-	if (errorLogsSaveTimer) return
-	errorLogsSaveTimer = setTimeout(() => {
-		errorLogsSaveTimer = undefined
-		saveErrorLogs().catch((error) => {
-			console.error("Failed to save error logs:", error)
-		})
-	}, 2000)
-}
-
 const saveActivitySnapshot = async () => {
+	await ensureStorageDir()
 	const jobs = Array.from(jobMeta.values()).map((job) => ({
 		id: job.id,
 		userId: job.userId,
@@ -659,6 +636,7 @@ const loadSystemHistory = async () => {
 }
 
 const saveSystemHistory = async () => {
+	await ensureStorageDir()
 	await writeFile(
 		SYSTEM_HISTORY_FILE,
 		JSON.stringify({ samples: systemHistory }, null, 2),
@@ -711,6 +689,78 @@ const startSystemHistoryCollector = () => {
 const isBanned = async (userId: number) => {
 	await loadBans()
 	return bans.has(userId)
+}
+
+const parseCookieStats = (content: string) => {
+	const lines = content.split(/\r?\n/)
+	const now = Math.floor(Date.now() / 1000)
+	let total = 0
+	let expired = 0
+	let session = 0
+	let earliestExpiry: number | undefined
+	let latestExpiry: number | undefined
+
+	for (const line of lines) {
+		const trimmed = line.trim()
+		if (!trimmed) continue
+		if (trimmed.startsWith("#") && !trimmed.startsWith("#HttpOnly_")) {
+			continue
+		}
+		const parts = trimmed.split("\t")
+		if (parts.length < 7) continue
+		total += 1
+		const rawExpiry = Number.parseInt(parts[4] || "0", 10)
+		if (!Number.isFinite(rawExpiry) || rawExpiry <= 0) {
+			session += 1
+			continue
+		}
+		if (rawExpiry < now) {
+			expired += 1
+		}
+		if (earliestExpiry === undefined || rawExpiry < earliestExpiry) {
+			earliestExpiry = rawExpiry
+		}
+		if (latestExpiry === undefined || rawExpiry > latestExpiry) {
+			latestExpiry = rawExpiry
+		}
+	}
+
+	return {
+		total,
+		expired,
+		session,
+		earliestExpiry: earliestExpiry
+			? new Date(earliestExpiry * 1000).toISOString()
+			: undefined,
+		latestExpiry: latestExpiry
+			? new Date(latestExpiry * 1000).toISOString()
+			: undefined,
+	}
+}
+
+const buildProxyStatus = async () => {
+	const envValue = YTDL_PROXY.trim()
+	let fileValue = ""
+	let fileMeta: { size: number; updatedAt: string } | undefined
+	try {
+		const stats = await stat(PROXY_FILE)
+		if (stats.isFile()) {
+			fileValue = (await readFile(PROXY_FILE, "utf-8")).trim()
+			fileMeta = {
+				size: stats.size,
+				updatedAt: stats.mtime.toISOString(),
+			}
+		}
+	} catch {}
+	const active = fileValue || envValue || ""
+	const source = fileValue ? "file" : envValue ? "env" : "none"
+	return {
+		active,
+		source,
+		fileValue,
+		envValue,
+		fileMeta,
+	}
 }
 
 const readProxyValue = async () => {
@@ -768,17 +818,6 @@ const logUserLink = async (
 	if (list.length > 200) list.length = 200
 	userLinks.set(userId, list)
 	scheduleUserLinksSave()
-}
-
-const logErrorEntry = async (entry: Omit<ErrorLogEntry, "id" | "at">) => {
-	await loadErrorLogs()
-	errorLogs.unshift({
-		id: randomUUID(),
-		at: new Date().toISOString(),
-		...entry,
-	})
-	if (errorLogs.length > 300) errorLogs.length = 300
-	scheduleErrorLogsSave()
 }
 
 const escapeHtml = (value: string) =>
@@ -3680,11 +3719,150 @@ server.get("/admin/links.json", requireDashboardAuth, async (req, res) => {
 
 server.get("/admin/errors.json", requireDashboardAuth, async (_req, res) => {
 	try {
-		await loadErrorLogs()
-		res.json({ total: errorLogs.length, errors: errorLogs })
+		const errors = await getErrorLogs()
+		res.json({ total: errors.length, errors })
 	} catch (error) {
 		console.error("Failed to load error logs:", error)
 		res.status(500).json({ error: "Failed to load error logs" })
+	}
+})
+
+server.get("/admin/cookies.json", requireDashboardAuth, async (req, res) => {
+	try {
+		const includeContent =
+			String(req.query.content || "").trim().toLowerCase() === "1"
+		try {
+			const stats = await stat(COOKIE_FILE)
+			if (!stats.isFile()) {
+				res.json({ exists: false })
+				return
+			}
+			const raw = await readFile(COOKIE_FILE, "utf-8")
+			const summary = parseCookieStats(raw)
+			res.json({
+				exists: true,
+				size: stats.size,
+				updatedAt: stats.mtime.toISOString(),
+				stats: summary,
+				content: includeContent ? raw : undefined,
+				example: cookieFormatExample,
+			})
+		} catch (error) {
+			res.json({
+				exists: false,
+				error: error instanceof Error ? error.message : String(error),
+				example: cookieFormatExample,
+			})
+		}
+	} catch (error) {
+		console.error("Failed to load cookies:", error)
+		res.status(500).json({ error: "Failed to load cookies" })
+	}
+})
+
+server.post("/admin/cookies.json", requireDashboardAuth, async (req, res) => {
+	try {
+		const content = typeof req.body?.content === "string" ? req.body.content : ""
+		const mode = String(req.body?.mode || "append").toLowerCase()
+		if (!content.trim()) {
+			res.status(400).json({ error: "Empty content" })
+			return
+		}
+		let result
+		if (mode === "replace") {
+			await ensureStorageDir()
+			await writeFile(COOKIE_FILE, content)
+			result = {
+				addedCookies: 0,
+				totalCookies: 0,
+				incomingCookieLines: 0,
+				invalidIncoming: 0,
+				incomingHttpOnlyLines: 0,
+				replaced: true,
+			}
+		} else {
+			let existing = ""
+			try {
+				existing = await readFile(COOKIE_FILE, "utf-8")
+			} catch {}
+			const merged = mergeCookieContent(existing, content)
+			await ensureStorageDir()
+			await writeFile(COOKIE_FILE, merged.content)
+			result = merged
+		}
+		const stats = await stat(COOKIE_FILE)
+		const raw = await readFile(COOKIE_FILE, "utf-8")
+		const summary = parseCookieStats(raw)
+		res.json({
+			ok: true,
+			mode,
+			result,
+			size: stats.size,
+			updatedAt: stats.mtime.toISOString(),
+			stats: summary,
+		})
+	} catch (error) {
+		console.error("Failed to update cookies:", error)
+		res.status(500).json({ error: "Failed to update cookies" })
+	}
+})
+
+server.post("/admin/cookies/delete", requireDashboardAuth, async (_req, res) => {
+	try {
+		await unlink(COOKIE_FILE)
+		res.json({ ok: true })
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			res.json({ ok: true })
+			return
+		}
+		console.error("Failed to delete cookies:", error)
+		res.status(500).json({ error: "Failed to delete cookies" })
+	}
+})
+
+server.get("/admin/proxy.json", requireDashboardAuth, async (_req, res) => {
+	try {
+		const status = await buildProxyStatus()
+		res.json({
+			active: status.active,
+			source: status.source,
+			fileValue: status.fileValue,
+			envValue: status.envValue,
+			fileMeta: status.fileMeta,
+		})
+	} catch (error) {
+		console.error("Failed to load proxy:", error)
+		res.status(500).json({ error: "Failed to load proxy" })
+	}
+})
+
+server.post("/admin/proxy.json", requireDashboardAuth, async (req, res) => {
+	try {
+		const value = typeof req.body?.value === "string" ? req.body.value.trim() : ""
+		await ensureStorageDir()
+		await writeFile(PROXY_FILE, value)
+		const status = await buildProxyStatus()
+		res.json({ ok: true, ...status })
+	} catch (error) {
+		console.error("Failed to update proxy:", error)
+		res.status(500).json({ error: "Failed to update proxy" })
+	}
+})
+
+server.post("/admin/proxy/delete", requireDashboardAuth, async (_req, res) => {
+	try {
+		await unlink(PROXY_FILE)
+		const status = await buildProxyStatus()
+		res.json({ ok: true, ...status })
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			const status = await buildProxyStatus()
+			res.json({ ok: true, ...status })
+			return
+		}
+		console.error("Failed to delete proxy:", error)
+		res.status(500).json({ error: "Failed to delete proxy" })
 	}
 })
 
@@ -3944,6 +4122,18 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
           .chart-controls { display: flex; gap: 6px; flex-wrap: wrap; }
           .legend-item { display: inline-flex; align-items: center; gap: 6px; }
           .legend-dot { width: 10px; height: 10px; border-radius: 999px; display: inline-block; }
+          .cookie-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+          .cookie-box { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: #fff; }
+          .cookie-box h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); }
+          .cookie-box .value { font-size: 16px; font-weight: 600; }
+          .cookie-text { width: 100%; min-height: 180px; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+          .cookie-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+          .proxy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
+          .proxy-box { border: 1px solid var(--border); border-radius: 14px; padding: 12px; background: #fff; }
+          .proxy-box h4 { margin: 0 0 6px; font-size: 13px; color: var(--muted); }
+          .proxy-box .value { font-size: 16px; font-weight: 600; word-break: break-all; }
+          .proxy-text { width: 100%; min-height: 120px; border: 1px solid var(--border); border-radius: 12px; padding: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 12px; }
+          .proxy-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
           @media (max-width: 640px) {
             header, .container { padding: 20px; }
             h1 { font-size: 22px; }
@@ -3972,6 +4162,8 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             <button class="tab-btn" data-tab="users" data-i18n="tabUsers">Пользователи</button>
             <button class="tab-btn" data-tab="links" data-i18n="tabLinks">История загрузок</button>
             <button class="tab-btn" data-tab="errors" data-i18n="tabErrors">Ошибки</button>
+            <button class="tab-btn" data-tab="cookies" data-i18n="tabCookies">Куки</button>
+            <button class="tab-btn" data-tab="proxy" data-i18n="tabProxy">Прокси</button>
           </div>
 
           <section class="panel active" id="panel-stats">
@@ -4109,11 +4301,43 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
                     <th style="width:160px;" data-table="errors" data-sort="at" data-type="date" data-i18n="colTime">Time</th>
                     <th style="width:120px;" data-table="errors" data-sort="userId" data-type="number" data-i18n="colUser">User</th>
                     <th style="width:25%;" data-table="errors" data-sort="context" data-i18n="colContext">Context</th>
-                    <th style="width:45%;" data-table="errors" data-sort="error" data-i18n="colError">Error</th>
+                    <th style="width:20%;" data-table="errors" data-sort="url" data-i18n="colUrl">URL</th>
+                    <th style="width:25%;" data-table="errors" data-sort="error" data-i18n="colError">Error</th>
+                    <th style="width:10%;" data-i18n="colCopy">Copy</th>
                   </tr>
                 </thead>
                 <tbody id="errors-body"></tbody>
               </table>
+            </div>
+          </section>
+
+          <section class="panel" id="panel-cookies">
+            <div class="actions" style="margin-bottom:10px;">
+              <div class="cookie-row">
+                <button class="btn primary" id="cookies-load" data-i18n="btnLoad">Показать</button>
+                <button class="btn" id="cookies-append" data-i18n="btnAppend">Догрузить</button>
+                <button class="btn" id="cookies-replace" data-i18n="btnReplace">Заменить</button>
+                <button class="btn" id="cookies-delete" data-i18n="btnDelete">Удалить</button>
+              </div>
+            </div>
+            <div class="cookie-grid" id="cookies-stats"></div>
+            <div style="margin-top:12px;">
+              <textarea class="cookie-text" id="cookies-content" data-i18n-placeholder="cookiePlaceholder" placeholder="Paste cookies here..."></textarea>
+              <div class="meta" id="cookies-example" style="margin-top:8px;"></div>
+            </div>
+          </section>
+
+          <section class="panel" id="panel-proxy">
+            <div class="actions" style="margin-bottom:10px;">
+              <div class="proxy-row">
+                <button class="btn primary" id="proxy-load" data-i18n="btnLoad">Показать</button>
+                <button class="btn" id="proxy-save" data-i18n="btnSave">Сохранить</button>
+                <button class="btn" id="proxy-clear" data-i18n="btnDisable">Отключить</button>
+              </div>
+            </div>
+            <div class="proxy-grid" id="proxy-stats"></div>
+            <div style="margin-top:12px;">
+              <textarea class="proxy-text" id="proxy-value" data-i18n-placeholder="proxyPlaceholder" placeholder="socks5://user:pass@host:port"></textarea>
             </div>
           </section>
         </div>
@@ -4127,6 +4351,8 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             users: byId('panel-users'),
             links: byId('panel-links'),
             errors: byId('panel-errors'),
+            cookies: byId('panel-cookies'),
+            proxy: byId('panel-proxy'),
           };
           tabs.forEach(btn => btn.addEventListener('click', () => {
             tabs.forEach(b => b.classList.remove('active'));
@@ -4137,18 +4363,24 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
               const value = byId('links-user-id').value.trim();
               loadLinks(value);
             }
+            if (btn.dataset.tab === 'cookies') {
+              loadCookies(false);
+            }
+            if (btn.dataset.tab === 'proxy') {
+              loadProxy();
+            }
           }));
 
           const fmtTime = (iso) => {
             if (!iso) return '—';
             const d = new Date(iso);
             const pad = (v) => String(v).padStart(2, '0');
-            const hh = pad(d.getHours());
-            const mm = pad(d.getMinutes());
             const dd = pad(d.getDate());
             const month = pad(d.getMonth() + 1);
             const yyyy = d.getFullYear();
-            return hh + '-' + mm + '--' + dd + '-' + month + '-' + yyyy;
+            const hh = pad(d.getHours());
+            const mm = pad(d.getMinutes());
+            return dd + '-' + month + '-' + yyyy + '-' + hh + '-' + mm;
           };
           const fmtBytes = (value) => {
             if (!Number.isFinite(value)) return '—';
@@ -4170,6 +4402,11 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             return (days ? days + 'd ' : '') + hours + 'h ' + mins + 'm';
           };
           const escapeHtml = (val) => String(val ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          const truncateText = (val, maxLen) => {
+            const text = String(val ?? '');
+            if (text.length <= maxLen) return text;
+            return text.slice(0, maxLen) + '…';
+          };
           const state = { users: [], links: [], errors: [], activity: [] };
           const sortState = {};
           const pageState = {
@@ -4193,6 +4430,8 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
               tabUsers: 'Пользователи',
               tabLinks: 'История загрузок',
               tabErrors: 'Ошибки',
+              tabCookies: 'Куки',
+              tabProxy: 'Прокси',
               rows: 'Строк:',
               chartTitle: 'Загрузка сервера',
               chartLoad: 'Нагрузка 1м',
@@ -4213,16 +4452,46 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
               colUrl: 'Ссылка',
               colError: 'Ошибка',
               colContext: 'Контекст',
+              colCopy: 'Копия',
               colState: 'Состояние',
+              cookieExists: 'Файл',
+              cookieSize: 'Размер',
+              cookieUpdated: 'Обновлено',
+              cookieTotal: 'Всего',
+              cookieExpired: 'Просрочены',
+              cookieSession: 'Сессионные',
+              cookieEarliest: 'Ближайшее истечение',
+              cookieLatest: 'Самое дальнее истечение',
+              cookieExample: 'Пример формата:',
+              cookiePlaceholder: 'Вставьте cookies сюда...',
+              proxyActive: 'Активный',
+              proxySource: 'Источник',
+              proxyFile: 'Файл',
+              proxyEnv: 'Переменная',
+              proxyNone: 'Нет',
+              proxyUpdated: 'Обновлено',
+              proxySize: 'Размер',
+              proxyPlaceholder: 'socks5://user:pass@host:port',
               show: 'Показать',
+              btnLoad: 'Показать',
+              btnAppend: 'Догрузить',
+              btnReplace: 'Заменить',
+              btnDelete: 'Удалить',
+              btnSave: 'Сохранить',
+              btnDisable: 'Отключить',
+              msgEmptyContent: 'Пустой текст',
+              confirmDeleteCookies: 'Удалить файл cookies?',
               searchUsers: 'Поиск по имени, username или id',
               userIdOptional: 'User ID (необязательно)',
               statusOk: 'OK',
               statusBanned: 'BANNED',
+              statusMissing: 'Нет',
               btnBan: 'Бан',
               btnUnban: 'Разбан',
               btnLinks: 'Ссылки',
               btnCancel: 'Освободить',
+              btnCopy: 'Копировать',
+              btnCopied: 'Скопировано',
               emptyLinks: 'Нет данных',
               emptyErrors: 'Нет данных',
               emptyActivity: 'Нет активных задач',
@@ -4255,6 +4524,8 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
               tabUsers: 'Users',
               tabLinks: 'Download history',
               tabErrors: 'Errors',
+              tabCookies: 'Cookies',
+              tabProxy: 'Proxy',
               rows: 'Rows:',
               chartTitle: 'Server load',
               chartLoad: 'Load 1m',
@@ -4275,16 +4546,46 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
               colUrl: 'URL',
               colError: 'Error',
               colContext: 'Context',
+              colCopy: 'Copy',
               colState: 'State',
+              cookieExists: 'File',
+              cookieSize: 'Size',
+              cookieUpdated: 'Updated',
+              cookieTotal: 'Total',
+              cookieExpired: 'Expired',
+              cookieSession: 'Session',
+              cookieEarliest: 'Earliest expiry',
+              cookieLatest: 'Latest expiry',
+              cookieExample: 'Format example:',
+              cookiePlaceholder: 'Paste cookies here...',
+              proxyActive: 'Active',
+              proxySource: 'Source',
+              proxyFile: 'File',
+              proxyEnv: 'Env',
+              proxyNone: 'None',
+              proxyUpdated: 'Updated',
+              proxySize: 'Size',
+              proxyPlaceholder: 'socks5://user:pass@host:port',
               show: 'Show',
+              btnLoad: 'Load',
+              btnAppend: 'Append',
+              btnReplace: 'Replace',
+              btnDelete: 'Delete',
+              btnSave: 'Save',
+              btnDisable: 'Disable',
+              msgEmptyContent: 'Empty content',
+              confirmDeleteCookies: 'Delete cookies file?',
               searchUsers: 'Search by name, username or id',
               userIdOptional: 'User ID (optional)',
               statusOk: 'OK',
               statusBanned: 'BANNED',
+              statusMissing: 'Missing',
               btnBan: 'Ban',
               btnUnban: 'Unban',
               btnLinks: 'Links',
               btnCancel: 'Cancel',
+              btnCopy: 'Copy',
+              btnCopied: 'Copied',
               emptyLinks: 'No data',
               emptyErrors: 'No data',
               emptyActivity: 'No active jobs',
@@ -4428,14 +4729,26 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             const { slice, pages, page } = paginate(list, 'errors');
             renderPagination('errors', pages, page);
             byId('errors-body').innerHTML = slice.map((e, i) => (
+              (() => {
+                const rawError = e.error || '';
+                const encodedError = encodeURIComponent(rawError);
+                const preview = truncateText(rawError || '—', 200);
+                const copyBtn = rawError
+                  ? '<button class=\"btn\" data-action=\"copy-error\" data-error=\"' + encodedError + '\">' + t('btnCopy') + '</button>'
+                  : '—';
+                return (
               '<tr>' +
                 '<td>'+((page - 1) * pageState.errors.perPage + i + 1)+'</td>' +
                 '<td>'+fmtTime(e.at)+'</td>' +
                 '<td>'+(e.userId ?? '—')+'</td>' +
                 '<td>'+escapeHtml(e.context || '—')+'</td>' +
-                '<td>'+escapeHtml(e.error || '—')+'</td>' +
+                '<td>'+escapeHtml(e.url || '—')+'</td>' +
+                '<td>'+escapeHtml(preview)+'</td>' +
+                '<td>'+copyBtn+'</td>' +
               '</tr>'
-            )).join('') || '<tr><td colspan=\"5\">'+t('emptyErrors')+'</td></tr>';
+                );
+              })()
+            )).join('') || '<tr><td colspan=\"7\">'+t('emptyErrors')+'</td></tr>';
           };
 
           const renderActivity = (list) => {
@@ -4566,6 +4879,61 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             renderErrors(list);
           }
 
+          const renderProxyStats = (payload) => {
+            const sourceLabel = payload?.source === 'file'
+              ? t('proxyFile')
+              : payload?.source === 'env'
+                ? t('proxyEnv')
+                : t('proxyNone');
+            const cards = [
+              [t('proxyActive'), payload?.active || '—'],
+              [t('proxySource'), sourceLabel],
+              [t('proxyUpdated'), payload?.fileMeta?.updatedAt ? fmtTime(payload.fileMeta.updatedAt) : '—'],
+              [t('proxySize'), payload?.fileMeta?.size ? fmtBytes(payload.fileMeta.size) : '—'],
+            ];
+            byId('proxy-stats').innerHTML = cards.map(([k, v]) => (
+              '<div class=\"proxy-box\"><h4>'+k+'</h4><div class=\"value\">'+escapeHtml(v)+'</div></div>'
+            )).join('');
+            byId('proxy-value').value = payload?.fileValue || payload?.active || '';
+          };
+
+          async function loadProxy() {
+            const res = await fetch('/admin/proxy.json');
+            const data = await res.json();
+            renderProxyStats(data);
+          }
+
+          const renderCookieStats = (payload) => {
+            const stats = payload?.stats || {};
+            const exists = Boolean(payload?.exists);
+            const cards = [
+              [t('cookieExists'), exists ? t('statusOk') : t('statusMissing')],
+              [t('cookieSize'), exists ? fmtBytes(payload.size) : '—'],
+              [t('cookieUpdated'), exists ? fmtTime(payload.updatedAt) : '—'],
+              [t('cookieTotal'), Number.isFinite(stats.total) ? stats.total : '—'],
+              [t('cookieExpired'), Number.isFinite(stats.expired) ? stats.expired : '—'],
+              [t('cookieSession'), Number.isFinite(stats.session) ? stats.session : '—'],
+              [t('cookieEarliest'), stats.earliestExpiry ? fmtTime(stats.earliestExpiry) : '—'],
+              [t('cookieLatest'), stats.latestExpiry ? fmtTime(stats.latestExpiry) : '—'],
+            ];
+            byId('cookies-stats').innerHTML = cards.map(([k, v]) => (
+              '<div class=\"cookie-box\"><h4>'+k+'</h4><div class=\"value\">'+v+'</div></div>'
+            )).join('');
+            if (payload?.example) {
+              byId('cookies-example').textContent = t('cookieExample') + ' ' + payload.example;
+            }
+          };
+
+          async function loadCookies(withContent) {
+            const url = '/admin/cookies.json' + (withContent ? '?content=1' : '');
+            const res = await fetch(url);
+            const data = await res.json();
+            renderCookieStats(data);
+            if (withContent && typeof data.content === 'string') {
+              byId('cookies-content').value = data.content;
+            }
+          }
+
           async function loadActivity() {
             const res = await fetch('/admin/activity.json');
             const data = await res.json();
@@ -4671,6 +5039,87 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             renderUsers(state.users);
           });
 
+          byId('cookies-load').addEventListener('click', async () => {
+            await loadCookies(true);
+          });
+
+          byId('cookies-append').addEventListener('click', async () => {
+            const content = byId('cookies-content').value || '';
+            if (!content.trim()) {
+              alert(t('msgEmptyContent'));
+              return;
+            }
+            await fetch('/admin/cookies.json', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: 'append', content }),
+            });
+            await loadCookies(true);
+          });
+
+          byId('cookies-replace').addEventListener('click', async () => {
+            const content = byId('cookies-content').value || '';
+            if (!content.trim()) {
+              alert(t('msgEmptyContent'));
+              return;
+            }
+            await fetch('/admin/cookies.json', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ mode: 'replace', content }),
+            });
+            await loadCookies(true);
+          });
+
+          byId('cookies-delete').addEventListener('click', async () => {
+            if (!confirm(t('confirmDeleteCookies'))) return;
+            await fetch('/admin/cookies/delete', { method: 'POST' });
+            byId('cookies-content').value = '';
+            await loadCookies(false);
+          });
+
+          byId('proxy-load').addEventListener('click', async () => {
+            await loadProxy();
+          });
+
+          byId('proxy-save').addEventListener('click', async () => {
+            const value = byId('proxy-value').value || '';
+            await fetch('/admin/proxy.json', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ value }),
+            });
+            await loadProxy();
+          });
+
+          byId('proxy-clear').addEventListener('click', async () => {
+            await fetch('/admin/proxy/delete', { method: 'POST' });
+            await loadProxy();
+          });
+
+          byId('errors-body').addEventListener('click', async (event) => {
+            const btn = event.target.closest('button');
+            if (!btn) return;
+            if (btn.dataset.action !== 'copy-error') return;
+            const raw = btn.dataset.error || '';
+            const text = decodeURIComponent(raw);
+            if (!text) return;
+            try {
+              if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+                const prev = btn.textContent;
+                btn.textContent = t('btnCopied');
+                setTimeout(() => {
+                  btn.textContent = prev || t('btnCopy');
+                }, 1200);
+              } else {
+                prompt('Copy error', text);
+              }
+            } catch {
+              prompt('Copy error', text);
+            }
+          });
+
           byId('logout-btn').addEventListener('click', async () => {
             try {
               await fetch('/admin/logout', { credentials: 'include' });
@@ -4698,6 +5147,8 @@ server.get("/admin", requireDashboardAuth, async (_req, res) => {
             loadStats();
             loadSystem();
             drawChart();
+            loadCookies(false);
+            loadProxy();
           });
 
           ['users','links','errors','activity'].forEach(table => {
@@ -5372,6 +5823,12 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		
 		// Only send errors in private chats to avoid spamming groups
 		if (isPrivate) {
+			await logErrorEntry({
+				userId,
+				url: sourceUrl || url.text,
+				context: "message:url",
+				error: error instanceof Error ? error.message : `Couldn't process ${url.text}`,
+			})
 			await createUserReportPrompt(
 				ctx,
 				`URL: ${cleanUrl(url.text)}`,

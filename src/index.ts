@@ -1149,6 +1149,8 @@ const shouldTryGenericFallback = (url: string) => {
 const isInstagramUrl = (url: string) =>
 	urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 
+const shouldAttachReferer = (url: string) => urlMatcher(url, "ok.xxx")
+
 const fetchInstagramAuthor = async (url: string) => {
 	const clean = cleanUrl(url)
 	const controller = new AbortController()
@@ -2009,6 +2011,9 @@ const downloadAndSend = async (
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 		const proxyArgs = await getProxyArgs()
+		const refererArgs = shouldAttachReferer(sourceUrl || url)
+			? getRefererHeaderArgs(sourceUrl || url)
+			: []
 
 		let isMp3Format = selectedIsRawFormat && selectedQuality === "mp3"
 		let isAudioRequest =
@@ -2199,6 +2204,7 @@ const downloadAndSend = async (
 				...additionalArgs,
 				...impersonateArgs,
 				...youtubeArgs,
+				...refererArgs,
 			],
 			signal,
 			skipJsRuntimeForInfo,
@@ -2514,6 +2520,7 @@ const downloadAndSend = async (
 					...additionalArgs,
 					...impersonateArgs,
 					...youtubeArgs,
+					...refererArgs,
 				],
 				undefined,
 				signal,
@@ -2809,6 +2816,7 @@ const downloadAndSend = async (
 					...hlsPoTokenArgs,
 					...impersonateArgs,
 					...youtubeArgs,
+					...refererArgs,
 				]
 				try {
 					await runDownload(downloadArgs, baseExtraArgs, cookieArgsList)
@@ -5427,6 +5435,9 @@ bot.on("message:text", async (ctx, next) => {
 			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 			const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
 			const additionalArgs = isTiktok ? tiktokArgs : []
+			const refererArgs = shouldAttachReferer(sourceUrl)
+				? getRefererHeaderArgs(sourceUrl)
+				: []
 			const genericFallbacks = shouldTryGenericFallback(sourceUrl)
 				? buildGenericFallbacks(sourceUrl)
 				: []
@@ -5440,6 +5451,7 @@ bot.on("message:text", async (ctx, next) => {
 					...additionalArgs,
 					...impersonateArgs,
 					...youtubeArgs,
+					...refererArgs,
 				],
 				undefined,
 				false,
@@ -5730,6 +5742,9 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const isYouTube = isYouTubeUrl(url.text)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+		const refererArgs = shouldAttachReferer(sourceUrl)
+			? getRefererHeaderArgs(sourceUrl)
+			: []
 
 		if (useCobalt && !isSora) {
 			if (await useCobaltResolver()) {
@@ -5753,6 +5768,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				...additionalArgs,
 				...impersonateArgs,
 				...youtubeArgs,
+				...refererArgs,
 			],
 			undefined,
 			false,

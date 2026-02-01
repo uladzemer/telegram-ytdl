@@ -5580,28 +5580,27 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				}
 				const mediaItems = resolved.picker
 					.filter((p) => typeof p.url === "string" && p.url.length > 0)
-					.map((p, index) => ({
+					.map((p) => ({
 						type: p.type === "photo" ? ("photo" as const) : ("video" as const),
 						media: p.url,
-						caption: index === 0 ? caption : undefined,
-						parse_mode: index === 0 && caption ? "HTML" : undefined,
+						caption: undefined,
+						parse_mode: undefined,
 						...(p.type === "photo" ? {} : { supports_streaming: true }),
 					}))
 
 				const groups = chunkArray(10, mediaItems)
-				let firstGroup = true
 				for (const chunk of groups) {
-					if (!firstGroup) {
-						for (const item of chunk) {
-							item.caption = undefined
-							item.parse_mode = undefined
+					if (caption && chunk.length > 0) {
+						chunk[0] = {
+							...chunk[0],
+							caption,
+							parse_mode: "HTML",
 						}
 					}
 					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
 						reply_to_message_id: ctx.message.message_id,
 						message_thread_id: threadId,
 					})
-					firstGroup = false
 				}
 
 				await logUserLink(userId, sourceUrl, "success")

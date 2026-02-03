@@ -1037,9 +1037,58 @@ const parseHmsToSeconds = (value: string) => {
 	return hours * 3600 + minutes * 60 + seconds
 }
 
+const trimTrailingUrlPunctuation = (value: string) =>
+	value.replace(/[)\].,!?:;]+$/g, "")
+
+const extractMessageUrls = (ctx: any) => {
+	const text = ctx.message?.text || ""
+	const entities = Array.isArray(ctx.message?.entities)
+		? ctx.message.entities
+		: []
+	const urls: string[] = []
+	for (const entity of entities) {
+		if (
+			entity?.type === "url" &&
+			typeof entity.offset === "number" &&
+			typeof entity.length === "number"
+		) {
+			urls.push(text.slice(entity.offset, entity.offset + entity.length))
+			continue
+		}
+		if (entity?.type === "text_link" && typeof entity.url === "string") {
+			urls.push(entity.url)
+		}
+	}
+	if (urls.length === 0 && text) {
+		const matches = text.match(/https?:\/\/\S+/g)
+		if (matches) urls.push(...matches)
+	}
+	return urls.map(trimTrailingUrlPunctuation).filter(Boolean)
+}
+
 const isYouTubeUrl = (url: string) => {
 	try {
 		return urlMatcher(url, "youtube.com") || urlMatcher(url, "youtu.be")
+	} catch {
+		return false
+	}
+}
+
+const isYandexVtransUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (!host.endsWith("yandex.net")) return false
+		if (!host.includes("vtrans")) return false
+		const path = parsed.pathname.toLowerCase()
+		if (!path.includes("/tts/")) return false
+		return (
+			path.endsWith(".mp3") ||
+			path.endsWith(".m4a") ||
+			path.endsWith(".aac") ||
+			path.endsWith(".ogg") ||
+			path.endsWith(".opus")
+		)
 	} catch {
 		return false
 	}
@@ -1719,6 +1768,7 @@ type RequestCacheEntry = {
 	formats?: any[]
 	userId?: number
 	lockId?: string
+	externalAudioUrl?: string
 }
 type FormatEntry = {
 	format: any
@@ -2281,6 +2331,7 @@ const downloadAndSend = async (
 	forceHls = false,
 	sourceUrl?: string,
 	skipPlaylist = false,
+	externalAudioUrl?: string,
 ) => {
 	url = normalizeVimeoUrl(url)
 	if (sourceUrl) {
@@ -2297,6 +2348,13 @@ const downloadAndSend = async (
 	let selectedIsRawFormat = isRawFormat
 	let selectedForceHls = forceHls
 	let selectedFormatLabelTail = formatLabelTail
+	const externalAudio =
+		typeof externalAudioUrl === "string" && externalAudioUrl.trim()
+			? externalAudioUrl.trim()
+			: undefined
+	const externalAudioIsYandex = externalAudio
+		? isYandexVtransUrl(externalAudio)
+		: false
 	
 	try {
 		const isTiktok = urlMatcher(url, "tiktok.com")
@@ -2608,7 +2666,10 @@ const downloadAndSend = async (
 		const resolvedTitle = resolveTitle(info, isTiktok)
 		const title = overrideTitle || resolvedTitle
 		const captionUrl = sourceUrl || url
-		const caption = link(title || "Video", cleanUrl(captionUrl))
+		const captionBase = link(title || "Video", cleanUrl(captionUrl))
+		const caption = externalAudioIsYandex
+			? `${captionBase}\nПеревод: Yandex`
+			: captionBase
 		const infoDuration =
 			typeof info.duration === "number" && Number.isFinite(info.duration)
 				? info.duration
@@ -2922,33 +2983,64 @@ const downloadAndSend = async (
 			}
 
 		if (isAudioRequest) {
-			const downloadArgs = formatArgs.includes("--js-runtimes")
-				? formatArgs
-				: [...jsRuntimeArgs, ...formatArgs]
 			const audioBase = dashFileBase || "audio"
-			if (isMp3Format) {
-				tempFilePath = resolve(tempDir, `${audioBase}.mp3`)
-			} else if (info.ext && info.ext !== "none") {
-				tempFilePath = resolve(tempDir, `${audioBase}.${info.ext}`)
-			}
-			if (statusMessageId) {
-				await updateMessage(
-					ctx,
-					statusMessageId,
-					`Обработка: <b>${title}</b>\nСтатус: Скачиваем аудио...`,
+			if (externalAudio) {
+				tempFilePath = resolve(tempDir, `${audioBase}_translated.m4a`)
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Скачиваем перевод...`,
+					)
+				}
+				await spawnPromise(
+					"ffmpeg",
+					[
+						"-y",
+						"-i",
+						externalAudio,
+						"-vn",
+						"-c:a",
+						"aac",
+						"-b:a",
+						"192k",
+						"-ar",
+						"48000",
+						tempFilePath,
+					],
+					undefined,
+					signal,
 				)
-			}
+				if (!(await fileExists(tempFilePath, 1024))) {
+					throw new Error("Translated audio download failed")
+				}
+			} else {
+				const downloadArgs = formatArgs.includes("--js-runtimes")
+					? formatArgs
+					: [...jsRuntimeArgs, ...formatArgs]
+				if (isMp3Format) {
+					tempFilePath = resolve(tempDir, `${audioBase}.mp3`)
+				} else if (info.ext && info.ext !== "none") {
+					tempFilePath = resolve(tempDir, `${audioBase}.${info.ext}`)
+				}
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Скачиваем аудио...`,
+					)
+				}
 				await spawnPromise(
 					"yt-dlp",
 					[
 						url,
 						...downloadArgs,
-					"-o",
-					tempFilePath,
-					"--no-part",
-					"--no-warnings",
-					"--no-playlist",
-					...cookieArgsList,
+						"-o",
+						tempFilePath,
+						"--no-part",
+						"--no-warnings",
+						"--no-playlist",
+						...cookieArgsList,
 						...additionalArgs,
 						...impersonateArgs,
 						...youtubeArgs,
@@ -2958,6 +3050,7 @@ const downloadAndSend = async (
 					undefined,
 					signal,
 				)
+			}
 			const audio = new InputFile(tempFilePath)
 
 			if (statusMessageId) {
@@ -3432,6 +3525,112 @@ const downloadAndSend = async (
 			}
 			if (statusHeartbeat) clearInterval(statusHeartbeat)
 
+			let externalAudioApplied = false
+			if (externalAudio && !isMhtml) {
+				const translatedAudioPath = resolve(tempDir, "translated-audio.m4a")
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Скачиваем перевод...`,
+					)
+				}
+				await spawnPromise(
+					"ffmpeg",
+					[
+						"-y",
+						"-i",
+						externalAudio,
+						"-vn",
+						"-c:a",
+						"aac",
+						"-b:a",
+						"192k",
+						"-ar",
+						"48000",
+						translatedAudioPath,
+					],
+					undefined,
+					signal,
+				)
+				if (!(await fileExists(translatedAudioPath, 1024))) {
+					throw new Error("Translated audio download failed")
+				}
+				const muxContainer = outputContainer === "mp4" ? "mp4" : "mkv"
+				const translatedBase = dashFileBase || safeTitle || "video"
+				const translatedPath = resolve(
+					tempDir,
+					`${translatedBase}_translated.${muxContainer}`,
+				)
+				const hasOriginalAudio =
+					(info.acodec && info.acodec !== "none") ||
+					requestedFormats.some(
+						(format: any) => format?.acodec && format.acodec !== "none",
+					)
+				if (statusMessageId) {
+					await updateMessage(
+						ctx,
+						statusMessageId,
+						`Обработка: <b>${title}</b>\nСтатус: Микшируем перевод...`,
+					)
+				}
+				const muxArgs = hasOriginalAudio
+					? [
+							"-y",
+							"-i",
+							tempFilePath,
+							"-i",
+							translatedAudioPath,
+							"-filter_complex",
+							"[0:a]volume=0.35[a0];[a0][1:a]amix=inputs=2:weights=0.35 1.0:normalize=0[a]",
+							"-map",
+							"0:v:0",
+							"-map",
+							"[a]",
+							"-c:v",
+							"copy",
+							"-c:a",
+							"aac",
+							"-b:a",
+							"192k",
+							"-shortest",
+						]
+					: [
+							"-y",
+							"-i",
+							tempFilePath,
+							"-i",
+							translatedAudioPath,
+							"-map",
+							"0:v:0",
+							"-map",
+							"1:a:0",
+							"-c:v",
+							"copy",
+							"-c:a",
+							"aac",
+							"-b:a",
+							"192k",
+							"-shortest",
+						]
+				if (muxContainer === "mp4") {
+					muxArgs.push("-movflags", "+faststart")
+				}
+				muxArgs.push(translatedPath)
+				await spawnPromise("ffmpeg", muxArgs, undefined, signal)
+				if (await fileExists(translatedPath, 1024)) {
+					try {
+						await unlink(tempFilePath)
+					} catch {}
+					tempFilePath = translatedPath
+					outputContainer = muxContainer
+					externalAudioApplied = true
+				}
+				try {
+					await unlink(translatedAudioPath)
+				} catch {}
+			}
+
 			const hasVideoTrack = info.vcodec && info.vcodec !== "none"
 			const needsAudioFix =
 				(isTiktok || isInstagram) &&
@@ -3439,7 +3638,8 @@ const downloadAndSend = async (
 				!isMhtml &&
 				outputContainer === "mp4" &&
 				!isMp3Format &&
-				quality !== "audio"
+				quality !== "audio" &&
+				!externalAudioApplied
 
 			if (needsAudioFix && !audioTranscodeCodec) {
 				audioTranscodeCodec = "aac"
@@ -5905,12 +6105,16 @@ bot.on("message:text", async (ctx, next) => {
 		}
 		await deletePreviousMenuMessage(ctx)
 		await deleteUserMessage(ctx)
-		const url = ctx.message.text
-		if (!url) {
+		const urls = extractMessageUrls(ctx)
+		const externalAudioUrl = urls.find(isYandexVtransUrl)
+		const rawUrl =
+			urls.find((item) => !isYandexVtransUrl(item)) ||
+			(urls.length === 0 ? ctx.message.text : undefined)
+		if (!rawUrl) {
 			await ctx.reply("Invalid URL.")
 			return
 		}
-		const sourceUrl = normalizeVimeoUrl(url)
+		const sourceUrl = normalizeVimeoUrl(rawUrl)
 		void logUserLink(userId, sourceUrl, "requested")
 
 		const lockResult = lockUserUrl(userId, sourceUrl)
@@ -5923,7 +6127,7 @@ bot.on("message:text", async (ctx, next) => {
 		let keepLock = false
 		const processing = await ctx.reply("Получаем форматы...")
 		try {
-			let downloadUrl = normalizeVimeoUrl(url)
+			let downloadUrl = normalizeVimeoUrl(rawUrl)
 			let bypassTitle: string | undefined
 			const isThreads = threadsMatcher(downloadUrl)
 			if (isThreads) {
@@ -6074,6 +6278,7 @@ bot.on("message:text", async (ctx, next) => {
 				formats: filteredFormats,
 				userId,
 				lockId,
+				externalAudioUrl,
 			})
 			scheduleRequestExpiry(requestId)
 			keepLock = true
@@ -6138,14 +6343,26 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		return
 	}
 
-	const [url] = ctx.entities("url")
-	if (!url) return await next()
+	const urls = extractMessageUrls(ctx)
+	if (urls.length === 0) return await next()
+	const externalAudioUrl = urls.find(isYandexVtransUrl)
+	const primaryUrl = urls.find((item) => !isYandexVtransUrl(item))
+	const isPrivate = ctx.chat.type === "private"
+	if (!primaryUrl) {
+		if (isPrivate) {
+			await ctx.reply("Нужна ссылка на видео (и при желании ссылку на перевод).", {
+				reply_to_message_id: ctx.message.message_id,
+				message_thread_id: ctx.message.message_thread_id,
+			})
+		}
+		return
+	}
+	const url = { text: primaryUrl }
 
 	console.log(`[DEBUG] Processing URL from ${ctx.chat.id}: ${url.text}`)
 	url.text = normalizeVimeoUrl(url.text)
 	const sourceUrl = url.text
 
-	const isPrivate = ctx.chat.type === "private"
 	const threadId = ctx.message.message_thread_id
 	let processingMessage: any
 	const userId = ctx.from?.id
@@ -6466,6 +6683,8 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 					undefined,
 					false,
 					sourceUrl,
+					false,
+					externalAudioUrl,
 				)
 			})
 			lockTransferred = true
@@ -6482,6 +6701,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			title,
 			userId,
 			lockId,
+			externalAudioUrl,
 		})
 		scheduleRequestExpiry(requestId)
 		keepLock = true
@@ -6749,6 +6969,8 @@ bot.on("callback_query:data", async (ctx) => {
 					undefined,
 					false,
 					cached.sourceUrl,
+					false,
+					cached.externalAudioUrl,
 				)
 			})
 			return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -6881,6 +7103,8 @@ bot.on("callback_query:data", async (ctx) => {
 				undefined,
 				false,
 				cached.sourceUrl,
+				false,
+				cached.externalAudioUrl,
 			)
 		})
 		return await ctx.answerCallbackQuery({ text: "Поставлено в очередь..." })
@@ -6965,6 +7189,8 @@ bot.on("callback_query:data", async (ctx) => {
 			dashFormatLabel,
 			forceHls,
 			cached.sourceUrl,
+			false,
+			cached.externalAudioUrl,
 		)
 	})
 })

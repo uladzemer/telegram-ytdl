@@ -47,6 +47,7 @@ import { bot, server } from "./setup"
 import { translateText } from "./translate"
 import { Updater } from "./updater"
 import { chunkArray, removeHashtagsMentions, cleanUrl, cutoffWithNotice } from "./util"
+import { readJsonFile, writeFileAtomic } from "./file-util"
 import { execFile, spawn, type ExecFileOptions } from "node:child_process"
 
 const TEMP_PREFIX = "yakachokbot-"
@@ -470,25 +471,29 @@ type SystemHistoryEntry = {
 const loadUsers = async () => {
 	if (usersLoaded) return
 	usersLoaded = true
-	try {
-		const raw = await readFile(USERS_FILE, "utf-8")
-		const data = JSON.parse(raw) as { users?: Record<string, UserProfile> }
-		const entries = data?.users ?? {}
-		for (const [key, value] of Object.entries(entries)) {
-			const id = Number.parseInt(key)
-			if (Number.isNaN(id)) continue
-			users.set(id, { ...value, id })
-		}
-	} catch {}
+	const data = await readJsonFile(
+		USERS_FILE,
+		{ users: {} } as { users?: Record<string, UserProfile> },
+		{ label: "users", backupOnError: true },
+	)
+	const entries = data?.users ?? {}
+	for (const [key, value] of Object.entries(entries)) {
+		const id = Number.parseInt(key)
+		if (Number.isNaN(id)) continue
+		users.set(id, { ...value, id })
+	}
 }
 
 const saveUsers = async () => {
-	await ensureStorageDir()
-	const entries: Record<string, UserProfile> = {}
-	for (const [id, profile] of users.entries()) {
-		entries[String(id)] = profile
+	try {
+		const entries: Record<string, UserProfile> = {}
+		for (const [id, profile] of users.entries()) {
+			entries[String(id)] = profile
+		}
+		await writeFileAtomic(USERS_FILE, JSON.stringify({ users: entries }, null, 2))
+	} catch (error) {
+		console.error("Failed to save users:", error)
 	}
-	await writeFile(USERS_FILE, JSON.stringify({ users: entries }, null, 2))
 }
 
 const scheduleUsersSave = () => {
@@ -515,59 +520,65 @@ const incrementUserCounter = async (
 const loadBans = async () => {
 	if (bansLoaded) return
 	bansLoaded = true
-	try {
-		const raw = await readFile(BANS_FILE, "utf-8")
-		const data = JSON.parse(raw) as { bans?: Record<string, BanEntry> }
-		const entries = data?.bans ?? {}
-		for (const [key, value] of Object.entries(entries)) {
-			const id = Number.parseInt(key)
-			if (Number.isNaN(id)) continue
-			bans.set(id, { ...value, id })
-		}
-	} catch {}
+	const data = await readJsonFile(
+		BANS_FILE,
+		{ bans: {} } as { bans?: Record<string, BanEntry> },
+		{ label: "bans", backupOnError: true },
+	)
+	const entries = data?.bans ?? {}
+	for (const [key, value] of Object.entries(entries)) {
+		const id = Number.parseInt(key)
+		if (Number.isNaN(id)) continue
+		bans.set(id, { ...value, id })
+	}
 }
 
 const saveBans = async () => {
-	await ensureStorageDir()
-	const entries: Record<string, BanEntry> = {}
-	for (const [id, entry] of bans.entries()) {
-		entries[String(id)] = entry
+	try {
+		const entries: Record<string, BanEntry> = {}
+		for (const [id, entry] of bans.entries()) {
+			entries[String(id)] = entry
+		}
+		await writeFileAtomic(BANS_FILE, JSON.stringify({ bans: entries }, null, 2))
+	} catch (error) {
+		console.error("Failed to save bans:", error)
 	}
-	await writeFile(BANS_FILE, JSON.stringify({ bans: entries }, null, 2))
 }
 
 const loadUserLinks = async () => {
 	if (userLinksLoaded) return
 	userLinksLoaded = true
-	try {
-		const raw = await readFile(LINKS_FILE, "utf-8")
-		const data = JSON.parse(raw) as {
-			links?: Record<string, LinkHistoryEntry[]>
-		}
-		for (const [key, value] of Object.entries(data?.links ?? {})) {
-			const id = Number.parseInt(key)
-			if (Number.isNaN(id)) continue
-			if (!Array.isArray(value)) continue
-			const list = value
-				.filter(
-					(entry) =>
-						typeof entry?.url === "string" &&
-						typeof entry?.status === "string" &&
-						typeof entry?.at === "string",
-				)
-				.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
-			userLinks.set(id, list.slice(0, 200))
-		}
-	} catch {}
+	const data = await readJsonFile(
+		LINKS_FILE,
+		{ links: {} } as { links?: Record<string, LinkHistoryEntry[]> },
+		{ label: "links", backupOnError: true },
+	)
+	for (const [key, value] of Object.entries(data?.links ?? {})) {
+		const id = Number.parseInt(key)
+		if (Number.isNaN(id)) continue
+		if (!Array.isArray(value)) continue
+		const list = value
+			.filter(
+				(entry) =>
+					typeof entry?.url === "string" &&
+					typeof entry?.status === "string" &&
+					typeof entry?.at === "string",
+			)
+			.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+		userLinks.set(id, list.slice(0, 200))
+	}
 }
 
 const saveUserLinks = async () => {
-	await ensureStorageDir()
-	const entries: Record<string, LinkHistoryEntry[]> = {}
-	for (const [id, list] of userLinks.entries()) {
-		entries[String(id)] = list
+	try {
+		const entries: Record<string, LinkHistoryEntry[]> = {}
+		for (const [id, list] of userLinks.entries()) {
+			entries[String(id)] = list
+		}
+		await writeFileAtomic(LINKS_FILE, JSON.stringify({ links: entries }, null, 2))
+	} catch (error) {
+		console.error("Failed to save user links:", error)
 	}
-	await writeFile(LINKS_FILE, JSON.stringify({ links: entries }, null, 2))
 }
 
 const scheduleUserLinksSave = () => {
@@ -581,20 +592,23 @@ const scheduleUserLinksSave = () => {
 }
 
 const saveActivitySnapshot = async () => {
-	await ensureStorageDir()
-	const jobs = Array.from(jobMeta.values()).map((job) => ({
-		id: job.id,
-		userId: job.userId,
-		url: job.url,
-		state: job.state,
-	}))
-	const payload = {
-		updatedAt: new Date().toISOString(),
-		pending: queue.getPendingCount(),
-		active: queue.getActiveCount(),
-		jobs,
+	try {
+		const jobs = Array.from(jobMeta.values()).map((job) => ({
+			id: job.id,
+			userId: job.userId,
+			url: job.url,
+			state: job.state,
+		}))
+		const payload = {
+			updatedAt: new Date().toISOString(),
+			pending: queue.getPendingCount(),
+			active: queue.getActiveCount(),
+			jobs,
+		}
+		await writeFileAtomic(ACTIVITY_FILE, JSON.stringify(payload, null, 2))
+	} catch (error) {
+		console.error("Failed to save activity snapshot:", error)
 	}
-	await writeFile(ACTIVITY_FILE, JSON.stringify(payload, null, 2))
 }
 
 const scheduleActivitySave = () => {
@@ -610,21 +624,25 @@ const scheduleActivitySave = () => {
 const loadSystemHistory = async () => {
 	if (systemHistoryLoaded) return
 	systemHistoryLoaded = true
-	try {
-		const raw = await readFile(SYSTEM_HISTORY_FILE, "utf-8")
-		const data = JSON.parse(raw) as { samples?: SystemHistoryEntry[] }
-		if (Array.isArray(data?.samples)) {
-			systemHistory.push(...data.samples)
-		}
-	} catch {}
+	const data = await readJsonFile(
+		SYSTEM_HISTORY_FILE,
+		{ samples: [] } as { samples?: SystemHistoryEntry[] },
+		{ label: "system history", backupOnError: true },
+	)
+	if (Array.isArray(data?.samples)) {
+		systemHistory.push(...data.samples)
+	}
 }
 
 const saveSystemHistory = async () => {
-	await ensureStorageDir()
-	await writeFile(
-		SYSTEM_HISTORY_FILE,
-		JSON.stringify({ samples: systemHistory }, null, 2),
-	)
+	try {
+		await writeFileAtomic(
+			SYSTEM_HISTORY_FILE,
+			JSON.stringify({ samples: systemHistory }, null, 2),
+		)
+	} catch (error) {
+		console.error("Failed to save system history:", error)
+	}
 }
 
 const scheduleSystemHistorySave = () => {
@@ -650,7 +668,10 @@ const recordSystemSample = async () => {
 		memPercent,
 	})
 	const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1000
-	while (systemHistory.length > 0 && Date.parse(systemHistory[0].at) < cutoff) {
+	while (true) {
+		const first = systemHistory[0]
+		if (!first) break
+		if (Date.parse(first.at) >= cutoff) break
 		systemHistory.shift()
 	}
 	if (systemHistory.length > 10080) {
@@ -944,12 +965,15 @@ const safeGetInfoWithFallback = async (
 	signal?: AbortSignal,
 	skipJsRuntime = false,
 	fallbackArgs: string[][] = [],
+	proxyArgsOverride?: string[],
 ) => {
 	let lastError: unknown
 	const hasProxyArg =
 		args.includes("--proxy") ||
 		fallbackArgs.some((entry) => entry.includes("--proxy"))
-	const proxyArgs = hasProxyArg ? [] : await getProxyArgs()
+	const proxyArgs =
+		proxyArgsOverride ??
+		(hasProxyArg ? [] : await getProxyArgs())
 	const proxyFallbacks =
 		proxyArgs.length > 0 ? [...fallbackArgs, proxyArgs] : fallbackArgs
 	try {
@@ -1112,8 +1136,12 @@ type FallbackAttempt = {
 const getRefererHeaderArgs = (referer?: string) => {
 	if (!referer) return []
 	try {
-		new URL(referer)
-		return ["--add-header", `Referer: ${referer}`]
+		const parsed = new URL(referer)
+		const headers = [`Referer: ${referer}`]
+		if (parsed.hostname.endsWith("vimeo.com")) {
+			headers.push(`Origin: ${parsed.origin}`)
+		}
+		return headers.flatMap((header) => ["--add-header", header])
 	} catch {
 		return []
 	}
@@ -1142,6 +1170,7 @@ const shouldTryGenericFallback = (url: string) => {
 	if (urlMatcher(url, "tiktok.com")) return false
 	if (urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am"))
 		return false
+	if (isVimeoUrl(url)) return false
 	if (threadsMatcher(url) || soraMatcher(url) || xfreeMatcher(url)) return false
 	return true
 }
@@ -1149,7 +1178,98 @@ const shouldTryGenericFallback = (url: string) => {
 const isInstagramUrl = (url: string) =>
 	urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 
-const shouldAttachReferer = (url: string) => urlMatcher(url, "ok.xxx")
+const shouldAttachReferer = (url: string) =>
+	urlMatcher(url, "ok.xxx") || urlMatcher(url, "vimeo.com")
+
+const isVimeoUrl = (url: string) =>
+	urlMatcher(url, "vimeo.com") || urlMatcher(url, "player.vimeo.com")
+
+const normalizeVimeoUrl = (input: string) => {
+	try {
+		const parsed = new URL(input)
+		if (parsed.hostname === "api.vimeo.com") {
+			const match = parsed.pathname.match(/^\/videos\/(\d+)/)
+			if (match) {
+				return `https://vimeo.com/${match[1]}`
+			}
+		}
+		if (parsed.hostname === "player.vimeo.com") {
+			const match = parsed.pathname.match(/^\/video\/(\d+)/)
+			if (match) {
+				return `https://vimeo.com/${match[1]}`
+			}
+		}
+		return input
+	} catch {
+		return input
+	}
+}
+
+const isFormatUnavailableError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /requested format is not available/i.test(message)
+}
+
+const isRateLimitError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /http error 429|too many requests/i.test(message)
+}
+
+const isAuthError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /http error 401|unauthorized|http error 403|forbidden/i.test(message)
+}
+
+const sleepMs = (ms: number) =>
+	new Promise((resolve) => setTimeout(resolve, ms))
+
+let vimeoCooldownUntil = 0
+
+const waitForVimeoCooldown = async () => {
+	const now = Date.now()
+	if (now >= vimeoCooldownUntil) return
+	const delayMs = vimeoCooldownUntil - now
+	console.warn("[WARN] Vimeo cooldown active, waiting...", {
+		delaySeconds: Math.round(delayMs / 1000),
+	})
+	await sleepMs(delayMs)
+}
+
+const extendVimeoCooldown = (delayMs: number) => {
+	vimeoCooldownUntil = Math.max(vimeoCooldownUntil, Date.now() + delayMs)
+}
+
+const withRateLimitRetry = async <T>(
+	fn: () => Promise<T>,
+	isVimeo: boolean,
+	onRetry?: (delayMs: number, attempt: number) => Promise<void>,
+) => {
+	const maxAttempts = isVimeo ? 4 : 1
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		try {
+			if (isVimeo) {
+				await waitForVimeoCooldown()
+			}
+			return await fn()
+		} catch (error) {
+			if (isVimeo && isRateLimitError(error) && attempt < maxAttempts) {
+				const delayMs = 30000 * Math.pow(2, attempt - 1)
+				extendVimeoCooldown(delayMs)
+				console.warn("[WARN] Vimeo rate limit, retrying...", {
+					attempt,
+					delaySeconds: Math.round(delayMs / 1000),
+				})
+				if (onRetry) {
+					await onRetry(delayMs, attempt)
+				}
+				await sleepMs(delayMs)
+				continue
+			}
+			throw error
+		}
+	}
+	throw new Error("Failed after retries")
+}
 
 const fetchInstagramAuthor = async (url: string) => {
 	const clean = cleanUrl(url)
@@ -1965,7 +2085,9 @@ const getUserFromArgs = async (ctx: any, args: string[]) => {
 		} as UserProfile
 	}
 	if (args.length === 0) return null
-	const id = Number.parseInt(args[0], 10)
+	const rawId = args[0]
+	if (!rawId) return null
+	const id = Number.parseInt(rawId, 10)
 	if (Number.isNaN(id)) return null
 	await loadUsers()
 	return users.get(id) || { id }
@@ -1986,6 +2108,10 @@ const downloadAndSend = async (
 	sourceUrl?: string,
 	skipPlaylist = false,
 ) => {
+	url = normalizeVimeoUrl(url)
+	if (sourceUrl) {
+		sourceUrl = normalizeVimeoUrl(sourceUrl)
+	}
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
 	const tempDir = resolve("/tmp", `yakachokbot-${tempBaseId}`)
@@ -2003,6 +2129,7 @@ const downloadAndSend = async (
 		const isInstagram =
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const isErome = urlMatcher(url, "erome.com")
+		const isVimeo = isVimeoUrl(url)
 		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
 		let forceHlsDownload = selectedForceHls || isDirectHls
 		const additionalArgs = isTiktok ? tiktokArgs : []
@@ -2010,7 +2137,19 @@ const downloadAndSend = async (
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = await getProxyArgs()
+		const proxyArgs = isVimeo ? [] : await getProxyArgs()
+		const vimeoArgs = isVimeo
+			? [
+					"--sleep-requests",
+					"1",
+					"--extractor-retries",
+					"3",
+					"--retry-sleep",
+					"15",
+					"--extractor-args",
+					"vimeo:original_format_policy=never",
+				]
+			: []
 		const refererArgs = shouldAttachReferer(sourceUrl || url)
 			? getRefererHeaderArgs(sourceUrl || url)
 			: []
@@ -2140,39 +2279,51 @@ const downloadAndSend = async (
 			formatArgs = ["-x", "--audio-format", "mp3"]
 		} else if (isDirectHls) {
 			formatArgs = ["-f", "best"]
-		} else if (selectedQuality === "b") {
-			if (isYouTube) {
-				formatArgs = [
-					"-f",
-					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
-				]
-				fallbackFormatArgs = [
-					"-f",
-					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-				]
-			} else if (isErome) {
-				formatArgs = ["-f", "best[ext=mp4]/best"]
-			} else {
-				formatArgs = [
-					"-f",
-					"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+			} else if (selectedQuality === "b") {
+				if (isYouTube) {
+					formatArgs = [
+						"-f",
+						"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+					]
+					fallbackFormatArgs = [
+						"-f",
+						"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					]
+				} else if (isVimeo) {
+					formatArgs = ["-f", "bestvideo+bestaudio/best"]
+					fallbackFormatArgs = ["-f", "best"]
+				} else if (isErome) {
+					formatArgs = ["-f", "best[ext=mp4]/best"]
+				} else {
+					formatArgs = [
+						"-f",
+						"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 				]
 			}
-		} else {
-			if (isYouTube) {
-				formatArgs = [
-					"-f",
-					`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
-				]
-				fallbackFormatArgs = [
-					"-f",
-					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
-				]
 			} else {
-				formatArgs = [
-					"-f",
-					`bestvideo[height<=${selectedQuality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
-				]
+				if (isYouTube) {
+					formatArgs = [
+						"-f",
+						`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
+					]
+					fallbackFormatArgs = [
+						"-f",
+						`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+					]
+				} else if (isVimeo) {
+					formatArgs = [
+						"-f",
+						`bestvideo[height<=${selectedQuality}]+bestaudio/best[height<=${selectedQuality}]`,
+					]
+					fallbackFormatArgs = [
+						"-f",
+						`best[height<=${selectedQuality}]/best`,
+					]
+				} else {
+					formatArgs = [
+						"-f",
+						`bestvideo[height<=${selectedQuality}][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+					]
 			}
 		}
 
@@ -2192,24 +2343,93 @@ const downloadAndSend = async (
 		const genericFallbacks = shouldTryGenericFallback(fallbackSourceUrl)
 			? buildGenericFallbacks(fallbackSourceUrl)
 			: []
-		const info = await safeGetInfoWithFallback(
-			url,
-			[
-				"--dump-json",
-				...formatArgs,
-				"--no-warnings",
-				"--no-playlist",
-				...resumeArgs,
-				...cookieArgsList,
-				...additionalArgs,
-				...impersonateArgs,
-				...youtubeArgs,
-				...refererArgs,
-			],
-			signal,
-			skipJsRuntimeForInfo,
-			genericFallbacks.map((attempt) => attempt.args),
-		)
+		const vimeoCookieAttempts =
+			isVimeo && cookieArgsList.length > 0 ? [[], cookieArgsList] : [cookieArgsList]
+		const buildInfoArgs = (
+			formatOverride?: string[],
+			cookiesOverride: string[] = cookieArgsList,
+		) => [
+			"--dump-json",
+			...(formatOverride ?? formatArgs),
+			"--no-warnings",
+			"--no-playlist",
+			...resumeArgs,
+			...cookiesOverride,
+			...additionalArgs,
+			...impersonateArgs,
+			...youtubeArgs,
+			...refererArgs,
+			...vimeoArgs,
+		]
+
+		const infoFormatArgs = isVimeo ? [] : undefined
+		const fetchInfoWithCookies = async (cookiesOverride: string[]) => {
+			try {
+				return await safeGetInfoWithFallback(
+					url,
+					buildInfoArgs(infoFormatArgs, cookiesOverride),
+					signal,
+					skipJsRuntimeForInfo,
+					genericFallbacks.map((attempt) => attempt.args),
+					proxyArgs,
+				)
+			} catch (error) {
+				if (
+					isFormatUnavailableError(error) &&
+					(!infoFormatArgs || infoFormatArgs.length > 0 || formatArgs.length > 0)
+				) {
+					return await safeGetInfoWithFallback(
+						url,
+						buildInfoArgs([], cookiesOverride),
+						signal,
+						skipJsRuntimeForInfo,
+						genericFallbacks.map((attempt) => attempt.args),
+						proxyArgs,
+					)
+				}
+				throw error
+			}
+		}
+		const fetchInfoOnce = async () => {
+			let lastError: unknown
+			for (const cookiesOverride of vimeoCookieAttempts) {
+				try {
+					return await fetchInfoWithCookies(cookiesOverride)
+				} catch (error) {
+					lastError = error
+					if (isVimeo && cookiesOverride.length === 0 && isAuthError(error)) {
+						continue
+					}
+					throw error
+				}
+			}
+			throw lastError instanceof Error
+				? lastError
+				: new Error("No valid info")
+		}
+
+		const maxInfoAttempts = isVimeo ? 4 : 1
+		let info: any
+		for (let attempt = 1; attempt <= maxInfoAttempts; attempt += 1) {
+			try {
+				info = await fetchInfoOnce()
+				break
+			} catch (error) {
+				if (isVimeo && isRateLimitError(error) && attempt < maxInfoAttempts) {
+					const delayMs = 30000 * Math.pow(2, attempt - 1)
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							`Статус: Vimeo лимит, ждём ${Math.round(delayMs / 1000)}с...`,
+						)
+					}
+					await sleepMs(delayMs)
+					continue
+				}
+				throw error
+			}
+		}
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 		const title = overrideTitle || resolvedTitle
@@ -2252,7 +2472,7 @@ const downloadAndSend = async (
 		let estimatedSizeLabel = estimatedSize ? formatBytes(estimatedSize) : ""
 
 		let maxEstimatedFromFormats = 0
-		const formatsArray = Array.isArray(info.formats) ? info.formats : []
+			const formatsArray: any[] = Array.isArray(info.formats) ? info.formats : []
 		for (const format of formatsArray) {
 			const size = estimateFormatSize(format, infoDuration)
 			if (typeof size === "number" && size > maxEstimatedFromFormats) {
@@ -2338,6 +2558,9 @@ const downloadAndSend = async (
 					"-f",
 					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 				]
+			} else if (isVimeo) {
+				formatArgs = ["-f", "bestvideo+bestaudio/best"]
+				fallbackFormatArgs = ["-f", "best"]
 			} else if (isErome) {
 				formatArgs = ["-f", "best[ext=mp4]/best"]
 			} else {
@@ -2356,6 +2579,15 @@ const downloadAndSend = async (
 					"-f",
 					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
 				]
+			} else if (isVimeo) {
+				formatArgs = [
+					"-f",
+					`bestvideo[height<=${selectedQuality}]+bestaudio/best[height<=${selectedQuality}]`,
+				]
+				fallbackFormatArgs = [
+					"-f",
+					`best[height<=${selectedQuality}]/best`,
+				]
 			} else {
 				formatArgs = [
 					"-f",
@@ -2368,7 +2600,8 @@ const downloadAndSend = async (
 			? info.requested_formats
 			: []
 		const selectedFormat = formatsArray.find(
-			(format) => `${format?.format_id}` === selectedQuality,
+			(format: { format_id?: string | number }) =>
+				`${format?.format_id}` === selectedQuality,
 		)
 		if (selectedIsRawFormat && selectedFormat) {
 			requestedFormats = [selectedFormat]
@@ -2472,22 +2705,47 @@ const downloadAndSend = async (
 		if (fallbackFormatArgs && !fallbackFormatArgs.includes("--no-cache-dir")) {
 			fallbackFormatArgs.push("--no-cache-dir")
 		}
-		const formatArgsBase = [...formatArgs]
-		const usesHlsPreferred =
-			formatArgsBase.some((arg) => arg.includes("protocol*=m3u8")) ||
-			isHlsDownload
-		if (usesHlsPreferred) {
-			formatArgs.push(
-				"--downloader",
-				"ffmpeg",
-				"--hls-prefer-ffmpeg",
-				"--retries",
-				"1",
-				"--fragment-retries",
-				"1",
-				"--abort-on-unavailable-fragment",
-			)
-		}
+			const formatArgsBase = [...formatArgs]
+			const usesHlsPreferred =
+				formatArgsBase.some((arg) => arg.includes("protocol*=m3u8")) ||
+				isHlsDownload
+			if (usesHlsPreferred) {
+				formatArgs.push(
+					"--downloader",
+					"ffmpeg",
+					"--hls-prefer-ffmpeg",
+					"--retries",
+					"1",
+					"--fragment-retries",
+					"1",
+					"--abort-on-unavailable-fragment",
+				)
+			}
+
+			const explicitFormatId =
+				typeof info?.format_id === "string" ? info.format_id : undefined
+			const buildExplicitFormatArgs = (formatId: string) => {
+				const args = ["-f", formatId]
+				if (!isMhtml) {
+					args.push("--merge-output-format", outputContainer)
+				}
+				if (!args.includes("--no-cache-dir")) {
+					args.push("--no-cache-dir")
+				}
+				if (usesHlsPreferred) {
+					args.push(
+						"--downloader",
+						"ffmpeg",
+						"--hls-prefer-ffmpeg",
+						"--retries",
+						"1",
+						"--fragment-retries",
+						"1",
+						"--abort-on-unavailable-fragment",
+					)
+				}
+				return args
+			}
 
 		if (isAudioRequest) {
 			const downloadArgs = formatArgs.includes("--js-runtimes")
@@ -2506,25 +2764,26 @@ const downloadAndSend = async (
 					`Обработка: <b>${title}</b>\nСтатус: Скачиваем аудио...`,
 				)
 			}
-			await spawnPromise(
-				"yt-dlp",
-				[
-					url,
-					...downloadArgs,
+				await spawnPromise(
+					"yt-dlp",
+					[
+						url,
+						...downloadArgs,
 					"-o",
 					tempFilePath,
 					"--no-part",
 					"--no-warnings",
 					"--no-playlist",
 					...cookieArgsList,
-					...additionalArgs,
-					...impersonateArgs,
-					...youtubeArgs,
-					...refererArgs,
-				],
-				undefined,
-				signal,
-			)
+						...additionalArgs,
+						...impersonateArgs,
+						...youtubeArgs,
+						...refererArgs,
+						...vimeoArgs,
+					],
+					undefined,
+					signal,
+				)
 			const audio = new InputFile(tempFilePath)
 
 			if (statusMessageId) {
@@ -2713,34 +2972,90 @@ const downloadAndSend = async (
 				}, 15000)
 			}
 
-			const runDownload = async (
-				args: string[],
-				extraArgs: string[],
+				const runDownload = async (
+					args: string[],
+					extraArgs: string[],
 					cookieArgsOverride: string[] = cookieArgsList,
 				) => {
 					lastPercentValue = null
-					await spawnPromise(
-					"yt-dlp",
-					[
-						url,
-						...args,
-						...resumeArgs,
-						"-o",
-						tempFilePath,
-						"--no-part",
-						"--no-warnings",
-						"--no-playlist",
-						...cookieArgsOverride,
-						...additionalArgs,
-						...extraArgs,
-					],
-					onProgress,
-					signal,
-				)
-			}
+					const maxAttempts = isVimeo ? 3 : 1
+					let lastError: unknown
+					for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+						try {
+							if (isVimeo) {
+								await waitForVimeoCooldown()
+							}
+							await spawnPromise(
+								"yt-dlp",
+								[
+									url,
+									...args,
+									...resumeArgs,
+									"-o",
+									tempFilePath,
+									"--no-part",
+									"--no-warnings",
+									"--no-playlist",
+									...cookieArgsOverride,
+									...additionalArgs,
+									...extraArgs,
+									...vimeoArgs,
+								],
+								onProgress,
+								signal,
+							)
+							return
+						} catch (error) {
+							lastError = error
+								if (isVimeo && isRateLimitError(error) && attempt < maxAttempts) {
+									const delayMs = 30000 * Math.pow(2, attempt - 1)
+								extendVimeoCooldown(delayMs)
+								if (statusMessageId) {
+									await updateMessage(
+										ctx,
+										statusMessageId,
+										`Обработка: <b>${title}</b>\nСтатус: Vimeo лимит, ждём ${Math.round(delayMs / 1000)}с...`,
+									)
+								}
+								await sleepMs(delayMs)
+								continue
+							}
+							throw error
+						}
+					}
+					if (lastError) throw lastError
+				}
 
 			let downloadSucceeded = false
 			let lastDownloadError: unknown = null
+			const baseExtraArgs = [
+				...hlsPoTokenArgs,
+				...impersonateArgs,
+				...youtubeArgs,
+				...refererArgs,
+			]
+			const runDownloadWithCookies = async (args: string[]) => {
+				const cookieAttempts =
+					isVimeo && cookieArgsList.length > 0
+						? [[], cookieArgsList]
+						: [cookieArgsList]
+				let lastError: unknown
+				for (const cookiesOverride of cookieAttempts) {
+					try {
+						await runDownload(args, baseExtraArgs, cookiesOverride)
+						return
+					} catch (error) {
+						lastError = error
+						if (isVimeo && cookiesOverride.length === 0 && isAuthError(error)) {
+							continue
+						}
+						throw error
+					}
+				}
+				throw lastError instanceof Error
+					? lastError
+					: new Error("Download failed")
+			}
 			if (isYouTube && isHlsDownload) {
 				const hlsAttempts = [
 					{
@@ -2812,64 +3127,106 @@ const downloadAndSend = async (
 					if (downloadSucceeded) break
 				}
 			} else {
-				const baseExtraArgs = [
-					...hlsPoTokenArgs,
-					...impersonateArgs,
-					...youtubeArgs,
-					...refererArgs,
-				]
-				try {
-					await runDownload(downloadArgs, baseExtraArgs, cookieArgsList)
-					downloadSucceeded = true
-				} catch (error) {
-					lastDownloadError = error
-					for (const attempt of genericFallbacks) {
-						if (statusMessageId) {
-							await updateMessage(
-								ctx,
-								statusMessageId,
-								`Обработка: <b>${title}</b>\nСтатус: ${attempt.label}`,
-							)
-						}
-						try {
-							await runDownload(
-								[...downloadArgs, ...attempt.args],
-								baseExtraArgs,
-								cookieArgsList,
-							)
-							downloadSucceeded = true
-							break
-						} catch (fallbackError) {
-							lastDownloadError = fallbackError
-						}
+				if (isVimeo) {
+					try {
+						await runDownloadWithCookies(downloadArgs)
+						downloadSucceeded = true
+					} catch (error) {
+						lastDownloadError = error
 					}
-					if (!downloadSucceeded && proxyArgs.length > 0) {
-						if (statusMessageId) {
-							await updateMessage(
-								ctx,
-								statusMessageId,
-								`Обработка: <b>${title}</b>\nСтатус: пробуем через прокси...`,
-							)
+				} else {
+					try {
+						await runDownload(downloadArgs, baseExtraArgs, cookieArgsList)
+						downloadSucceeded = true
+					} catch (error) {
+						lastDownloadError = error
+						for (const attempt of genericFallbacks) {
+							if (statusMessageId) {
+								await updateMessage(
+									ctx,
+									statusMessageId,
+									`Обработка: <b>${title}</b>\nСтатус: ${attempt.label}`,
+								)
+							}
+							try {
+								await runDownload(
+									[...downloadArgs, ...attempt.args],
+									baseExtraArgs,
+									cookieArgsList,
+								)
+								downloadSucceeded = true
+								break
+							} catch (fallbackError) {
+								lastDownloadError = fallbackError
+							}
 						}
-						console.log("[DEBUG] Retrying yt-dlp download via proxy")
-						try {
-							await runDownload(
-								downloadArgs,
-								[...baseExtraArgs, ...proxyArgs],
-								cookieArgsList,
-							)
-							downloadSucceeded = true
-						} catch (proxyError) {
-							lastDownloadError = proxyError
+						if (!downloadSucceeded && proxyArgs.length > 0) {
+							if (statusMessageId) {
+								await updateMessage(
+									ctx,
+									statusMessageId,
+									`Обработка: <b>${title}</b>\nСтатус: пробуем через прокси...`,
+								)
+							}
+							console.log("[DEBUG] Retrying yt-dlp download via proxy")
+							try {
+								await runDownload(
+									downloadArgs,
+									[...baseExtraArgs, ...proxyArgs],
+									cookieArgsList,
+								)
+								downloadSucceeded = true
+							} catch (proxyError) {
+								lastDownloadError = proxyError
+							}
 						}
 					}
 				}
 			}
 
-			if (!downloadSucceeded) {
-				if (!fallbackFormatArgs) {
-					throw lastDownloadError instanceof Error
-						? lastDownloadError
+				if (!downloadSucceeded) {
+					if (
+						explicitFormatId &&
+						isFormatUnavailableError(lastDownloadError)
+					) {
+						const explicitArgs = buildExplicitFormatArgs(explicitFormatId)
+						const explicitDownloadArgs =
+							explicitArgs.includes("--js-runtimes") || skipJsRuntime
+								? explicitArgs
+								: [...jsRuntimeArgs, ...explicitArgs]
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								`Обработка: <b>${title}</b>\nСтатус: формат недоступен, пробуем другой...`,
+							)
+						}
+						try {
+							if (isVimeo) {
+								await runDownloadWithCookies(explicitDownloadArgs)
+							} else {
+								await runDownload(
+									explicitDownloadArgs,
+									[
+										...hlsPoTokenArgs,
+										...impersonateArgs,
+										...youtubeArgs,
+										...refererArgs,
+									],
+									cookieArgsList,
+								)
+							}
+							downloadSucceeded = true
+						} catch (explicitError) {
+							lastDownloadError = explicitError
+						}
+					}
+				}
+
+				if (!downloadSucceeded) {
+					if (!fallbackFormatArgs) {
+						throw lastDownloadError instanceof Error
+							? lastDownloadError
 						: new Error("Download failed")
 				}
 				const retryArgs =
@@ -2883,11 +3240,20 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: HLS недоступен, пробуем другое...`,
 					)
 				}
-				await runDownload(
-					retryArgs,
-					[...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
-					cookieArgsList,
-				)
+				if (isVimeo) {
+					await runDownloadWithCookies(retryArgs)
+				} else {
+					await runDownload(
+						retryArgs,
+						[
+							...hlsPoTokenArgs,
+							...impersonateArgs,
+							...youtubeArgs,
+							...refererArgs,
+						],
+						cookieArgsList,
+					)
+				}
 				downloadSucceeded = true
 			}
 			if (statusHeartbeat) clearInterval(statusHeartbeat)
@@ -3708,7 +4074,7 @@ server.get("/admin/users", requireDashboardAuth, async (_req, res) => {
 
 server.get("/admin/users/:id/links.json", requireDashboardAuth, async (req, res) => {
 	try {
-		const userId = Number.parseInt(req.params.id, 10)
+		const userId = Number.parseInt(String(req.params.id || ""), 10)
 		if (!Number.isFinite(userId)) {
 			res.status(400).json({ error: "Invalid user id" })
 			return
@@ -3956,7 +4322,7 @@ server.get("/admin/activity.json", requireDashboardAuth, async (_req, res) => {
 
 server.post("/admin/users/:id/ban", requireDashboardAuth, async (req, res) => {
 	try {
-		const userId = Number.parseInt(req.params.id, 10)
+		const userId = Number.parseInt(String(req.params.id || ""), 10)
 		if (!Number.isFinite(userId)) {
 			res.status(400).json({ error: "Invalid user id" })
 			return
@@ -3979,7 +4345,7 @@ server.post("/admin/users/:id/ban", requireDashboardAuth, async (req, res) => {
 
 server.post("/admin/users/:id/unban", requireDashboardAuth, async (req, res) => {
 	try {
-		const userId = Number.parseInt(req.params.id, 10)
+		const userId = Number.parseInt(String(req.params.id || ""), 10)
 		if (!Number.isFinite(userId)) {
 			res.status(400).json({ error: "Invalid user id" })
 			return
@@ -3996,7 +4362,7 @@ server.post("/admin/users/:id/unban", requireDashboardAuth, async (req, res) => 
 
 server.post("/admin/users/:id/cancel", requireDashboardAuth, async (req, res) => {
 	try {
-		const userId = Number.parseInt(req.params.id, 10)
+		const userId = Number.parseInt(String(req.params.id || ""), 10)
 		if (!Number.isFinite(userId)) {
 			res.status(400).json({ error: "Invalid user id" })
 			return
@@ -5370,7 +5736,7 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Invalid URL.")
 			return
 		}
-		const sourceUrl = url
+		const sourceUrl = normalizeVimeoUrl(url)
 		void logUserLink(userId, sourceUrl, "requested")
 
 		const lockResult = lockUserUrl(userId, sourceUrl)
@@ -5383,7 +5749,7 @@ bot.on("message:text", async (ctx, next) => {
 		let keepLock = false
 		const processing = await ctx.reply("Получаем форматы...")
 		try {
-			let downloadUrl = url
+			let downloadUrl = normalizeVimeoUrl(url)
 			let bypassTitle: string | undefined
 			const isThreads = threadsMatcher(downloadUrl)
 			if (isThreads) {
@@ -5430,33 +5796,70 @@ bot.on("message:text", async (ctx, next) => {
 					return
 				}
 			}
-			const isYouTube = isYouTubeUrl(downloadUrl)
-			const cookieArgsList = await cookieArgs()
-			const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-			const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
-			const additionalArgs = isTiktok ? tiktokArgs : []
-			const refererArgs = shouldAttachReferer(sourceUrl)
-				? getRefererHeaderArgs(sourceUrl)
-				: []
-			const genericFallbacks = shouldTryGenericFallback(sourceUrl)
-				? buildGenericFallbacks(sourceUrl)
-				: []
-			const info = await safeGetInfoWithFallback(
-				downloadUrl,
-				[
-					"--dump-json",
-					"--no-warnings",
-					"--no-playlist",
-					...cookieArgsList,
-					...additionalArgs,
-					...impersonateArgs,
-					...youtubeArgs,
-					...refererArgs,
-				],
-				undefined,
-				false,
-				genericFallbacks.map((attempt) => attempt.args),
-			)
+				const isYouTube = isYouTubeUrl(downloadUrl)
+				const cookieArgsList = await cookieArgs()
+				const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+				const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
+				const isVimeo = isVimeoUrl(downloadUrl)
+				const additionalArgs = isTiktok ? tiktokArgs : []
+				const proxyArgs = isVimeo ? [] : await getProxyArgs()
+				const vimeoArgs = isVimeo
+					? [
+							"--sleep-requests",
+							"1",
+							"--extractor-retries",
+							"3",
+							"--retry-sleep",
+							"15",
+							"--extractor-args",
+							"vimeo:original_format_policy=never",
+						]
+					: []
+				const refererArgs = shouldAttachReferer(sourceUrl)
+					? getRefererHeaderArgs(sourceUrl)
+					: []
+				const genericFallbacks = shouldTryGenericFallback(sourceUrl)
+					? buildGenericFallbacks(sourceUrl)
+					: []
+				const vimeoCookieAttempts =
+					isVimeo && cookieArgsList.length > 0
+						? [[], cookieArgsList]
+						: [cookieArgsList]
+				const fetchInfoOnce = async () => {
+					let lastError: unknown
+					for (const cookiesOverride of vimeoCookieAttempts) {
+						try {
+							return await safeGetInfoWithFallback(
+								downloadUrl,
+								[
+									"--dump-json",
+									"--no-warnings",
+									"--no-playlist",
+									...cookiesOverride,
+									...additionalArgs,
+									...impersonateArgs,
+									...youtubeArgs,
+									...refererArgs,
+									...vimeoArgs,
+								],
+								undefined,
+								false,
+								genericFallbacks.map((attempt) => attempt.args),
+								proxyArgs,
+							)
+						} catch (error) {
+							lastError = error
+							if (isVimeo && cookiesOverride.length === 0 && isAuthError(error)) {
+								continue
+							}
+							throw error
+						}
+					}
+					throw lastError instanceof Error
+						? lastError
+						: new Error("No valid info")
+				}
+				const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
 
 			if (!info.formats || info.formats.length === 0) {
 				await ctx.reply("No formats found.")
@@ -5546,6 +5949,7 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 	if (!url) return await next()
 
 	console.log(`[DEBUG] Processing URL from ${ctx.chat.id}: ${url.text}`)
+	url.text = normalizeVimeoUrl(url.text)
 	const sourceUrl = url.text
 
 	const isPrivate = ctx.chat.type === "private"
@@ -5590,7 +5994,13 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				if (isInstagramUrl(url.text)) {
 					caption = await buildInstagramCaption(url.text)
 				}
-				const mediaItems = resolved.picker
+				const mediaItems: Array<{
+					type: "photo" | "video"
+					media: string
+					caption?: string
+					parse_mode?: "HTML"
+					supports_streaming?: boolean
+				}> = resolved.picker
 					.filter((p) => typeof p.url === "string" && p.url.length > 0)
 					.map((p) => ({
 						type: p.type === "photo" ? ("photo" as const) : ("video" as const),
@@ -5600,15 +6010,18 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 						...(p.type === "photo" ? {} : { supports_streaming: true }),
 					}))
 
-				const groups = chunkArray(10, mediaItems)
-				for (const chunk of groups) {
-					if (caption && chunk.length > 0) {
-						chunk[0] = {
-							...chunk[0],
-							caption,
-							parse_mode: "HTML",
+					const groups = chunkArray(10, mediaItems)
+					for (const chunk of groups) {
+						if (caption && chunk.length > 0) {
+							const first = chunk[0]
+							if (first) {
+								chunk[0] = {
+									...first,
+									caption,
+									parse_mode: "HTML",
+								}
+							}
 						}
-					}
 					await bot.api.sendMediaGroup(ctx.chat.id, chunk, {
 						reply_to_message_id: ctx.message.message_id,
 						message_thread_id: threadId,
@@ -5737,11 +6150,25 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		}
 
 		const isTiktok = urlMatcher(url.text, "tiktok.com")
+		const isVimeo = isVimeoUrl(url.text)
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const isYouTube = isYouTubeUrl(url.text)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
+		const proxyArgs = isVimeo ? [] : await getProxyArgs()
+		const vimeoArgs = isVimeo
+			? [
+					"--sleep-requests",
+					"1",
+					"--extractor-retries",
+					"3",
+					"--retry-sleep",
+					"15",
+					"--extractor-args",
+					"vimeo:original_format_policy=never",
+				]
+			: []
 		const refererArgs = shouldAttachReferer(sourceUrl)
 			? getRefererHeaderArgs(sourceUrl)
 			: []
@@ -5756,24 +6183,45 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 		const genericFallbacks = shouldTryGenericFallback(sourceUrl)
 			? buildGenericFallbacks(sourceUrl)
 			: []
-		const info = await safeGetInfoWithFallback(
-			url.text,
-			[
-				"--dump-json",
-				"--no-warnings",
-				"-q",
-				"--no-progress",
-				"--no-playlist",
-				...cookieArgsList,
-				...additionalArgs,
-				...impersonateArgs,
-				...youtubeArgs,
-				...refererArgs,
-			],
-			undefined,
-			false,
-			genericFallbacks.map((attempt) => attempt.args),
-		)
+		const vimeoCookieAttempts =
+			isVimeo && cookieArgsList.length > 0 ? [[], cookieArgsList] : [cookieArgsList]
+		const fetchInfoOnce = async () => {
+			let lastError: unknown
+			for (const cookiesOverride of vimeoCookieAttempts) {
+				try {
+					return await safeGetInfoWithFallback(
+						url.text,
+						[
+							"--dump-json",
+							"--no-warnings",
+							"-q",
+							"--no-progress",
+							"--no-playlist",
+							...cookiesOverride,
+							...additionalArgs,
+							...impersonateArgs,
+							...youtubeArgs,
+							...refererArgs,
+							...vimeoArgs,
+						],
+						undefined,
+						false,
+						genericFallbacks.map((attempt) => attempt.args),
+						proxyArgs,
+					)
+				} catch (error) {
+					lastError = error
+					if (isVimeo && cookiesOverride.length === 0 && isAuthError(error)) {
+						continue
+					}
+					throw error
+				}
+			}
+			throw lastError instanceof Error
+				? lastError
+				: new Error("No valid info")
+		}
+		const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 			const title =
@@ -5953,7 +6401,13 @@ bot.on("callback_query:data", async (ctx) => {
 	}
 	if (data.startsWith("report:")) {
 		const [, reportId] = data.split(":")
-		const report = reportId ? userReports.get(reportId) : undefined
+		if (!reportId) {
+			return await ctx.answerCallbackQuery({
+				text: "Запрос устарел",
+				show_alert: true,
+			})
+		}
+		const report = userReports.get(reportId)
 		if (!report) {
 			return await ctx.answerCallbackQuery({
 				text: "Запрос устарел",

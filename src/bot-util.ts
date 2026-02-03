@@ -40,7 +40,11 @@ const formatUserIdLink = (user?: UserLike) => {
 }
 
 export const deleteMessage = (message: Message) => {
-	return bot.api.deleteMessage(message.chat.id, message.message_id)
+	return bot.api
+		.deleteMessage(message.chat.id, message.message_id)
+		.catch((error) => {
+			console.warn("Failed to delete message:", error)
+		})
 }
 
 export const errorMessage = (
@@ -53,7 +57,7 @@ export const errorMessage = (
 
 	const messageText = bold("Ошибка.")
 
-	const tasks = [
+	const tasks: Array<Promise<unknown>> = [
 		bot.api.sendMessage(chat.id, messageText, { parse_mode: "HTML" }),
 	]
 
@@ -83,7 +87,13 @@ export const errorMessage = (
 		)
 	}
 
-	return Promise.all(tasks)
+	return Promise.allSettled(tasks).then((results) => {
+		for (const result of results) {
+			if (result.status === "rejected") {
+				console.error("Failed to send error message:", result.reason)
+			}
+		}
+	})
 }
 
 export const notifyAdminError = (
@@ -101,7 +111,7 @@ export const notifyAdminError = (
 		user?.id && user.id !== ADMIN_ID
 			? new InlineKeyboard().text("Ban user", `ban:${user.id}`)
 			: undefined
-	const tasks = [
+	const tasks: Array<Promise<unknown>> = [
 		bot.api.sendMessage(ADMIN_ID, adminMessage, {
 			parse_mode: "HTML",
 			reply_markup: keyboard,
@@ -116,5 +126,11 @@ export const notifyAdminError = (
 			),
 		)
 	}
-	return Promise.all(tasks)
+	return Promise.allSettled(tasks).then((results) => {
+		for (const result of results) {
+			if (result.status === "rejected") {
+				console.error("Failed to notify admin:", result.reason)
+			}
+		}
+	})
 }

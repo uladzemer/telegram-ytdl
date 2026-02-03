@@ -2,6 +2,7 @@ name: yakachokbot
 
 services:
   telegram-bot:
+    image: yakachokbot:latest
     build: .
     restart: unless-stopped
     volumes:
@@ -56,7 +57,7 @@ services:
         max-file: "3"
 
   admin-panel:
-    build: .
+    image: yakachokbot:latest
     restart: unless-stopped
     volumes:
       - ./yakachokbot:/app/storage

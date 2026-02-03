@@ -64,13 +64,49 @@ const dashboardPort = Number.parseInt(ADMIN_DASHBOARD_PORT, 10)
 const dashboardHost = ADMIN_DASHBOARD_HOST || "127.0.0.1"
 const webhookPort = Number.parseInt(WEBHOOK_PORT, 10)
 
+const defaultCommands = [
+	{ command: "formats", description: "Показать доступные форматы" },
+	{ command: "cancel", description: "Отменить все задания" },
+]
+
+const adminCommands = [
+	{ command: "formats", description: "Показать доступные форматы" },
+	{ command: "cancel", description: "Отменить все задания" },
+	{ command: "cookie", description: "Upload cookies info" },
+	{ command: "clear", description: "Clear cookies" },
+	{ command: "proxy", description: "Set proxy for yt-dlp" },
+	{ command: "user", description: "Show user profile" },
+	{ command: "ban", description: "Ban user by ID" },
+	{ command: "unban", description: "Unban user by ID" },
+	{ command: "stats", description: "Show user stats" },
+	{ command: "send", description: "Send replied media to user" },
+]
+
+const setCommandsSafely = async () => {
+	try {
+		await bot.api.setMyCommands(defaultCommands)
+	} catch (error) {
+		console.error("Failed to set bot commands:", error)
+	}
+	try {
+		await bot.api.setMyCommands(adminCommands, {
+			scope: { type: "chat", chat_id: ADMIN_ID },
+		})
+	} catch (error) {
+		console.error("Failed to set admin commands:", error)
+	}
+}
+
 const startDashboardServer = () => {
 	if (!Number.isFinite(dashboardPort) || dashboardPort <= 0) {
 		console.warn("ADMIN_DASHBOARD_PORT is invalid, admin panel is disabled.")
 		return
 	}
-	server.listen(dashboardPort, dashboardHost, () => {
+	const httpServer = server.listen(dashboardPort, dashboardHost, () => {
 		console.log(`Admin HTTP server listening on http://${dashboardHost}:${dashboardPort}`)
+	})
+	httpServer.on("error", (error) => {
+		console.error("Admin HTTP server error:", error)
 	})
 }
 
@@ -81,32 +117,21 @@ if (ADMIN_ONLY) {
 	server.use(webhookCallback(bot, "express"))
 
 	console.log(`Starting bot with root ${API_ROOT}...`)
-	server.listen(WEBHOOK_PORT, async () => {
-		await bot.api.setWebhook(WEBHOOK_URL)
-		await bot.api.setMyCommands([
-			{ command: "formats", description: "Показать доступные форматы" },
-			{ command: "cancel", description: "Отменить все задания" },
-		])
-
-		await bot.api.setMyCommands(
-			[
-				{ command: "formats", description: "Показать доступные форматы" },
-				{ command: "cancel", description: "Отменить все задания" },
-				{ command: "cookie", description: "Upload cookies info" },
-				{ command: "clear", description: "Clear cookies" },
-				{ command: "proxy", description: "Set proxy for yt-dlp" },
-				{ command: "user", description: "Show user profile" },
-				{ command: "ban", description: "Ban user by ID" },
-				{ command: "unban", description: "Unban user by ID" },
-				{ command: "stats", description: "Show user stats" },
-				{ command: "send", description: "Send replied media to user" },
-			],
-			{ scope: { type: "chat", chat_id: ADMIN_ID } },
-		)
-		console.log(`Webhook set to ${WEBHOOK_URL}`)
-
-		const me = await bot.api.getMe()
-		console.log(`Bot started as @${me.username} on :${WEBHOOK_PORT}`)
+	const httpServer = server.listen(webhookPort, () => {
+		void (async () => {
+			try {
+				await bot.api.setWebhook(WEBHOOK_URL)
+				await setCommandsSafely()
+				console.log(`Webhook set to ${WEBHOOK_URL}`)
+				const me = await bot.api.getMe()
+				console.log(`Bot started as @${me.username} on :${webhookPort}`)
+			} catch (error) {
+				console.error("Failed to start webhook bot:", error)
+			}
+		})()
+	})
+	httpServer.on("error", (error) => {
+		console.error("Webhook server error:", error)
 	})
 
 	if (
@@ -122,27 +147,12 @@ if (ADMIN_ONLY) {
 		drop_pending_updates: true,
 		allowed_updates: ["message", "callback_query", "my_chat_member"],
 		onStart: async (me) => {
-			await bot.api.setMyCommands([
-				{ command: "formats", description: "Показать доступные форматы" },
-				{ command: "cancel", description: "Отменить все задания" },
-			])
-
-			await bot.api.setMyCommands(
-				[
-					{ command: "formats", description: "Показать доступные форматы" },
-					{ command: "cancel", description: "Отменить все задания" },
-					{ command: "cookie", description: "Upload cookies info" },
-					{ command: "clear", description: "Clear cookies" },
-					{ command: "proxy", description: "Set proxy for yt-dlp" },
-					{ command: "user", description: "Show user profile" },
-					{ command: "ban", description: "Ban user by ID" },
-					{ command: "unban", description: "Unban user by ID" },
-					{ command: "stats", description: "Show user stats" },
-					{ command: "send", description: "Send replied media to user" },
-				],
-				{ scope: { type: "chat", chat_id: ADMIN_ID } },
-			)
-			console.log(`Bot started as @${me.username} (Polling)`)
+			try {
+				await setCommandsSafely()
+				console.log(`Bot started as @${me.username} (Polling)`)
+			} catch (error) {
+				console.error("Failed to initialize polling bot:", error)
+			}
 		},
 	})
 }

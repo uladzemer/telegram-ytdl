@@ -1,8 +1,21 @@
 import { COBALT_INSTANCE_URL } from "./environment"
 
+const COBALT_TIMEOUT_MS = 5000
+
+const fetchWithTimeout = async (url: string, options?: RequestInit) => {
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), COBALT_TIMEOUT_MS)
+	try {
+		return await fetch(url, { ...options, signal: controller.signal })
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
 export const checkCobaltInstance = async () => {
 	try {
-		const infoRequest = await fetch(COBALT_INSTANCE_URL)
+		if (!COBALT_INSTANCE_URL) return false
+		const infoRequest = await fetchWithTimeout(COBALT_INSTANCE_URL)
 		if (infoRequest.status !== 200) {
 			throw new Error("Invalid cobalt instance url")
 		}
@@ -37,7 +50,7 @@ export const cobaltMatcher = (url: string) => {
 }
 
 export const cobaltResolver = async (url: string) => {
-	const infoRequest = await fetch(COBALT_INSTANCE_URL, {
+	const infoRequest = await fetchWithTimeout(COBALT_INSTANCE_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",

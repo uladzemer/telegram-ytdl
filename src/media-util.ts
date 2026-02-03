@@ -19,8 +19,12 @@ const execWithTimeout = async (
 }
 
 export const urlMatcher = (url: string, matcher: string) => {
-	const parsed = new URL(url)
-	return parsed.hostname.endsWith(matcher)
+	try {
+		const parsed = new URL(url)
+		return parsed.hostname.endsWith(matcher)
+	} catch {
+		return false
+	}
 }
 
 export const getVideoMetadata = async (filePath: string) => {

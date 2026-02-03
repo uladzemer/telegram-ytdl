@@ -1,7 +1,7 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
-import { ERRORS_FILE, STORAGE_DIR } from "./environment"
+import { ERRORS_FILE } from "./environment"
 import { cutoffWithNotice } from "./util"
+import { readJsonFile, writeFileAtomic } from "./file-util"
 
 export type ErrorLogEntry = {
 	id: string
@@ -16,29 +16,25 @@ const errorLogs: ErrorLogEntry[] = []
 let errorLogsLoaded = false
 let errorLogsSaveTimer: NodeJS.Timeout | undefined
 
-const ensureStorageDir = async () => {
-	try {
-		await mkdir(STORAGE_DIR, { recursive: true })
-	} catch (error) {
-		console.error("Failed to create storage dir:", error)
-	}
-}
-
 export const loadErrorLogs = async () => {
 	if (errorLogsLoaded) return
 	errorLogsLoaded = true
-	try {
-		const raw = await readFile(ERRORS_FILE, "utf-8")
-		const data = JSON.parse(raw) as { errors?: ErrorLogEntry[] }
-		if (Array.isArray(data?.errors)) {
-			errorLogs.push(...data.errors)
-		}
-	} catch {}
+	const data = await readJsonFile(
+		ERRORS_FILE,
+		{ errors: [] } as { errors?: ErrorLogEntry[] },
+		{ label: "error logs", backupOnError: true },
+	)
+	if (Array.isArray(data?.errors)) {
+		errorLogs.push(...data.errors)
+	}
 }
 
 const saveErrorLogs = async () => {
-	await ensureStorageDir()
-	await writeFile(ERRORS_FILE, JSON.stringify({ errors: errorLogs }, null, 2))
+	try {
+		await writeFileAtomic(ERRORS_FILE, JSON.stringify({ errors: errorLogs }, null, 2))
+	} catch (error) {
+		console.error("Failed to save error logs:", error)
+	}
 }
 
 const scheduleErrorLogsSave = () => {

@@ -65,6 +65,7 @@ import { execFile, spawn, type ExecFileOptions } from "node:child_process"
 const TEMP_PREFIX = "yakachokbot-"
 const AUDIO_LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 const AUDIO_LOUDNORM_MUSIC_FILTER = "loudnorm=I=-14:TP=-1.0:LRA=11"
+const TRANSLATION_AUDIO_FILTER = "alimiter=limit=0.9"
 const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 	? Math.max(1, CLEANUP_INTERVAL_HOURS)
 	: 6
@@ -3498,7 +3499,7 @@ const downloadAndSend = async (
 							externalAudio,
 							"-vn",
 							"-af",
-							AUDIO_LOUDNORM_FILTER,
+							TRANSLATION_AUDIO_FILTER,
 							"-c:a",
 							"aac",
 							"-b:a",

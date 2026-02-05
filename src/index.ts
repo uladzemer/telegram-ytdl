@@ -70,6 +70,9 @@ const TEMP_PREFIX = "yakachokbot-"
 const AUDIO_LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 const AUDIO_LOUDNORM_MUSIC_FILTER = "loudnorm=I=-14:TP=-1.0:LRA=11"
 const TRANSLATION_AUDIO_FILTER = "alimiter=limit=0.9"
+const SPONSORBLOCK_BASE_URL = "https://sponsor.ajay.app"
+const SPONSORBLOCK_TIMEOUT_MS = 5000
+const SPONSORBLOCK_MIN_GAP_SECONDS = 0.3
 const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 	? Math.max(1, CLEANUP_INTERVAL_HOURS)
 	: 6
@@ -1189,6 +1192,151 @@ const isYouTubeUrl = (url: string) => {
 	} catch {
 		return false
 	}
+}
+
+const extractYouTubeVideoId = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (host.endsWith("youtu.be")) {
+			const id = parsed.pathname.split("/").filter(Boolean)[0]
+			return id || null
+		}
+		if (host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) {
+			const v = parsed.searchParams.get("v")
+			if (v) return v
+			const parts = parsed.pathname.split("/").filter(Boolean)
+			if (parts[0] === "shorts" || parts[0] === "embed" || parts[0] === "live") {
+				return parts[1] || null
+			}
+		}
+		return null
+	} catch {
+		return null
+	}
+}
+
+const fetchSponsorSegments = async (videoId: string) => {
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), SPONSORBLOCK_TIMEOUT_MS)
+	try {
+		const categories = encodeURIComponent(JSON.stringify(["sponsor"]))
+		const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categories}`
+		const res = await fetch(apiUrl, {
+			signal: controller.signal,
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+			},
+		})
+		if (res.status === 404) return []
+		if (!res.ok) {
+			throw new Error(`SponsorBlock HTTP ${res.status}`)
+		}
+		const data = await res.json()
+		if (!Array.isArray(data)) return []
+		const ranges: Array<[number, number]> = []
+		for (const entry of data) {
+			const segment = entry?.segment
+			if (!Array.isArray(segment) || segment.length < 2) continue
+			const start = Number(segment[0])
+			const end = Number(segment[1])
+			if (!Number.isFinite(start) || !Number.isFinite(end)) continue
+			if (end <= start) continue
+			ranges.push([start, end])
+		}
+		return ranges
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
+const mergeSponsorSegments = (segments: Array<[number, number]>, duration?: number) => {
+	const sorted = [...segments].sort((a, b) => a[0] - b[0])
+	const merged: Array<[number, number]> = []
+	for (const [rawStart, rawEnd] of sorted) {
+		let start = Math.max(0, rawStart)
+		let end = Math.max(start, rawEnd)
+		if (typeof duration === "number") {
+			start = Math.min(start, duration)
+			end = Math.min(end, duration)
+		}
+		if (end <= start) continue
+		const last = merged[merged.length - 1]
+		if (last && start <= last[1] + 0.01) {
+			last[1] = Math.max(last[1], end)
+		} else {
+			merged.push([start, end])
+		}
+	}
+	return merged
+}
+
+const buildKeepRanges = (segments: Array<[number, number]>, duration: number) => {
+	const keep: Array<[number, number]> = []
+	let cursor = 0
+	for (const [start, end] of segments) {
+		if (start - cursor > SPONSORBLOCK_MIN_GAP_SECONDS) {
+			keep.push([cursor, start])
+		}
+		cursor = Math.max(cursor, end)
+		if (cursor >= duration) break
+	}
+	if (duration - cursor > SPONSORBLOCK_MIN_GAP_SECONDS) {
+		keep.push([cursor, duration])
+	}
+	return keep
+}
+
+const trimVideoByRanges = async (
+	inputPath: string,
+	ranges: Array<[number, number]>,
+	outputPath: string,
+	container: string,
+	signal?: AbortSignal,
+) => {
+	const partFiles: string[] = []
+	for (const [index, [start, end]] of ranges.entries()) {
+		const partPath = `${inputPath}.sb_part_${index}.${container}`
+		const args = [
+			"-y",
+			"-ss",
+			`${start}`,
+			"-to",
+			`${end}`,
+			"-i",
+			inputPath,
+			"-c",
+			"copy",
+			"-avoid_negative_ts",
+			"make_zero",
+			"-reset_timestamps",
+			"1",
+		]
+		if (container === "mp4") {
+			args.push("-movflags", "+faststart")
+		}
+		args.push(partPath)
+		await spawnPromise("ffmpeg", args, undefined, signal)
+		partFiles.push(partPath)
+	}
+	const concatPath = `${inputPath}.sb_concat.txt`
+	const concatContent = partFiles.map((file) => `file '${file.replace(/'/g, "'\\''")}'`).join("\n")
+	await writeFile(concatPath, concatContent)
+	const concatArgs = ["-y", "-f", "concat", "-safe", "0", "-i", concatPath, "-c", "copy"]
+	if (container === "mp4") {
+		concatArgs.push("-movflags", "+faststart")
+	}
+	concatArgs.push(outputPath)
+	await spawnPromise("ffmpeg", concatArgs, undefined, signal)
+	for (const file of partFiles) {
+		try {
+			await unlink(file)
+		} catch {}
+	}
+	try {
+		await unlink(concatPath)
+	} catch {}
 }
 
 const isYandexVtransUrl = (url: string) => {
@@ -3042,6 +3190,7 @@ const downloadAndSend = async (
 	sourceUrl?: string,
 	skipPlaylist = false,
 	externalAudioUrl?: string,
+	sponsorCutRequested = false,
 ) => {
 	url = normalizeVimeoUrl(url)
 	if (sourceUrl) {
@@ -4464,6 +4613,72 @@ const downloadAndSend = async (
 					try {
 						await unlink(audioFixedPath)
 					} catch {}
+				}
+			}
+
+			if (sponsorCutRequested && isYouTube && !isAudioRequest && !isMhtml) {
+				const videoId = extractYouTubeVideoId(sourceUrl || url)
+				if (!videoId) {
+					console.warn("[WARN] SponsorBlock: failed to extract video ID", {
+						url: cleanUrl(sourceUrl || url),
+					})
+				} else {
+					if (statusMessageId) {
+						await updateMessage(
+							ctx,
+							statusMessageId,
+							`Обработка: <b>${title}</b>\nСтатус: Ищем рекламные сегменты...`,
+						)
+					}
+					try {
+						const segments = await fetchSponsorSegments(videoId)
+						if (segments.length > 0) {
+							const metadata = await getVideoMetadata(tempFilePath)
+							const duration =
+								metadata.duration ||
+								(typeof info.duration === "number" ? info.duration : undefined)
+							if (!duration) {
+								console.warn("[WARN] SponsorBlock: missing duration, skipping trim", {
+									url: cleanUrl(sourceUrl || url),
+									videoId,
+								})
+							} else {
+								const mergedSegments = mergeSponsorSegments(segments, duration)
+								const keepRanges = buildKeepRanges(mergedSegments, duration)
+								if (keepRanges.length === 0) {
+									console.warn("[WARN] SponsorBlock: no keep ranges after merge", {
+										url: cleanUrl(sourceUrl || url),
+										videoId,
+									})
+								} else {
+									if (statusMessageId) {
+										await updateMessage(
+											ctx,
+											statusMessageId,
+											`Обработка: <b>${title}</b>\nСтатус: Вырезаем рекламу...`,
+										)
+									}
+									const sbBase = sanitizeFilePart(title || "video", "video")
+									const trimmedPath = resolve(
+										tempDir,
+										`${sbBase}_sb.${outputContainer}`,
+									)
+									await trimVideoByRanges(
+										tempFilePath,
+										keepRanges,
+										trimmedPath,
+										outputContainer,
+										signal,
+									)
+									if (await fileExists(trimmedPath, 1024)) {
+										tempFilePath = trimmedPath
+									}
+								}
+							}
+						}
+					} catch (error) {
+						console.error("SponsorBlock trim error:", error)
+					}
 				}
 			}
 
@@ -6954,6 +7169,47 @@ const enqueueTranslateJob = async (
 	})
 }
 
+const enqueueSponsorJob = async (
+	ctx: any,
+	userId: number,
+	rawUrl: string,
+	replyToMessageId?: number,
+) => {
+	const sourceUrl = normalizeVimeoUrl(rawUrl)
+	if (!isYouTubeUrl(sourceUrl)) {
+		await ctx.reply("SponsorBlock доступен только для YouTube.")
+		return
+	}
+	void logUserLink(userId, sourceUrl, "requested")
+	const lockResult = lockUserUrl(userId, sourceUrl)
+	if (!lockResult.ok) {
+		await ctx.reply("Эта ссылка уже в обработке. Дождитесь завершения.")
+		return
+	}
+	void incrementUserCounter(userId, "requests")
+	const lockId = lockResult.lockId
+	const processing = await ctx.reply("Ставим в очередь SponsorBlock...")
+	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
+		await downloadAndSend(
+			ctx,
+			sourceUrl,
+			"b",
+			false,
+			processing.message_id,
+			undefined,
+			replyToMessageId,
+			signal,
+			false,
+			undefined,
+			false,
+			sourceUrl,
+			false,
+			undefined,
+			true,
+		)
+	})
+}
+
 bot.command("formats", async (ctx) => {
 	await deleteUserMessage(ctx)
 	const userId = ctx.from?.id
@@ -7001,6 +7257,32 @@ bot.command("translate", async (ctx) => {
 		externalAudioUrl,
 		ctx.message?.message_id,
 	)
+})
+
+bot.command("sponsor", async (ctx) => {
+	await deleteUserMessage(ctx)
+	const userId = ctx.from?.id
+	if (!userId) return
+	const previousPrompt = userPromptMessages.get(userId)
+	if (previousPrompt) {
+		try {
+			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
+		} catch {}
+		userPromptMessages.delete(userId)
+	}
+	userState.delete(userId)
+	let urls = extractUrlsFromMessage(ctx.message)
+	if (urls.length === 0 && ctx.message?.reply_to_message) {
+		urls = extractUrlsFromMessage(ctx.message.reply_to_message)
+	}
+	const rawUrl = urls[0]
+	if (!rawUrl) {
+		userState.set(userId, "waiting_for_sponsor_url")
+		const prompt = await ctx.reply("Пришлите ссылку на YouTube видео.")
+		userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
+		return
+	}
+	await enqueueSponsorJob(ctx, userId, rawUrl, ctx.message?.message_id)
 })
 
 bot.command("cancel", async (ctx) => {
@@ -7262,6 +7544,27 @@ bot.on("message:text", async (ctx, next) => {
 			}
 			await deleteMessage(processing)
 		}
+		return
+	}
+	if (state === "waiting_for_sponsor_url") {
+		userState.delete(userId)
+		const promptMessage = userPromptMessages.get(userId)
+		if (promptMessage) {
+			try {
+				await ctx.api.deleteMessage(promptMessage.chatId, promptMessage.messageId)
+			} catch {}
+			userPromptMessages.delete(userId)
+		}
+		await deletePreviousMenuMessage(ctx)
+		const replyToMessageId = ctx.message?.message_id
+		await deleteUserMessage(ctx)
+		const urls = extractMessageUrls(ctx)
+		const rawUrl = urls[0] || ctx.message.text
+		if (!rawUrl) {
+			await ctx.reply("Invalid URL.")
+			return
+		}
+		await enqueueSponsorJob(ctx, userId, rawUrl, replyToMessageId)
 		return
 	}
 	if (state === "waiting_for_translate_url") {

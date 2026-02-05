@@ -66,6 +66,7 @@ const webhookPort = Number.parseInt(WEBHOOK_PORT, 10)
 
 const defaultCommands = [
 	{ command: "formats", description: "Показать доступные форматы" },
+	{ command: "sponsor", description: "Скачать без рекламной интеграции" },
 	{ command: "cancel", description: "Отменить все задания" },
 ]
 
@@ -76,6 +77,7 @@ const privateCommands = [
 
 const adminCommands = [
 	{ command: "formats", description: "Показать доступные форматы" },
+	{ command: "sponsor", description: "Скачать без рекламной интеграции" },
 	{ command: "cancel", description: "Отменить все задания" },
 	{ command: "translate", description: "Перевести видео" },
 	{ command: "cookie", description: "Upload cookies info" },

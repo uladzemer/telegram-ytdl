@@ -73,6 +73,18 @@ const TRANSLATION_AUDIO_FILTER = "alimiter=limit=0.9"
 const SPONSORBLOCK_BASE_URL = "https://sponsor.ajay.app"
 const SPONSORBLOCK_TIMEOUT_MS = 5000
 const SPONSORBLOCK_MIN_GAP_SECONDS = 0.3
+const SPONSORBLOCK_DEFAULT_CATEGORIES = ["sponsor"]
+const SPONSORBLOCK_ALL_CATEGORIES = [
+	"sponsor",
+	"selfpromo",
+	"interaction",
+	"intro",
+	"outro",
+	"preview",
+	"poi_highlight",
+	"filler",
+	"music_offtopic",
+]
 const cleanupIntervalHours = Number.isFinite(CLEANUP_INTERVAL_HOURS)
 	? Math.max(1, CLEANUP_INTERVAL_HOURS)
 	: 6
@@ -1216,12 +1228,19 @@ const extractYouTubeVideoId = (url: string) => {
 	}
 }
 
-const fetchSponsorSegments = async (videoId: string) => {
+const fetchSponsorSegments = async (
+	videoId: string,
+	categories: string[] = SPONSORBLOCK_DEFAULT_CATEGORIES,
+) => {
 	const controller = new AbortController()
 	const timeout = setTimeout(() => controller.abort(), SPONSORBLOCK_TIMEOUT_MS)
 	try {
-		const categories = encodeURIComponent(JSON.stringify(["sponsor"]))
-		const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categories}`
+		const normalizedCategories =
+			Array.isArray(categories) && categories.length > 0
+				? categories
+				: SPONSORBLOCK_DEFAULT_CATEGORIES
+		const categoriesParam = encodeURIComponent(JSON.stringify(normalizedCategories))
+		const apiUrl = `${SPONSORBLOCK_BASE_URL}/api/skipSegments?videoID=${encodeURIComponent(videoId)}&categories=${categoriesParam}`
 		const res = await fetch(apiUrl, {
 			signal: controller.signal,
 			headers: {
@@ -3191,6 +3210,7 @@ const downloadAndSend = async (
 	skipPlaylist = false,
 	externalAudioUrl?: string,
 	sponsorCutRequested = false,
+	sponsorCategories?: string[],
 ) => {
 	url = normalizeVimeoUrl(url)
 	if (sourceUrl) {
@@ -4627,11 +4647,11 @@ const downloadAndSend = async (
 						await updateMessage(
 							ctx,
 							statusMessageId,
-							`Обработка: <b>${title}</b>\nСтатус: Ищем рекламные сегменты...`,
+							`Обработка: <b>${title}</b>\nСтатус: Ищем сегменты SponsorBlock...`,
 						)
 					}
 					try {
-						const segments = await fetchSponsorSegments(videoId)
+						const segments = await fetchSponsorSegments(videoId, sponsorCategories)
 						if (segments.length > 0) {
 							const metadata = await getVideoMetadata(tempFilePath)
 							const duration =
@@ -4655,7 +4675,7 @@ const downloadAndSend = async (
 										await updateMessage(
 											ctx,
 											statusMessageId,
-											`Обработка: <b>${title}</b>\nСтатус: Вырезаем рекламу...`,
+											`Обработка: <b>${title}</b>\nСтатус: Вырезаем сегменты...`,
 										)
 									}
 									const sbBase = sanitizeFilePart(title || "video", "video")
@@ -4836,6 +4856,7 @@ const runTranslatedDownload = async (params: {
 	overrideTitle?: string
 	externalAudioUrl?: string
 	sponsorCutRequested?: boolean
+	sponsorCategories?: string[]
 }) => {
 	const {
 		ctx,
@@ -4847,6 +4868,7 @@ const runTranslatedDownload = async (params: {
 		overrideTitle,
 		externalAudioUrl,
 		sponsorCutRequested = false,
+		sponsorCategories,
 	} = params
 	const translateTarget = sourceUrl || url
 	let audioUrl = externalAudioUrl
@@ -4885,6 +4907,7 @@ const runTranslatedDownload = async (params: {
 			false,
 			audioUrl,
 			sponsorCutRequested,
+			sponsorCategories,
 		)
 		logTranslate("complete", {
 			chat: ctx.chat?.id,
@@ -7107,11 +7130,19 @@ const taskOptions = new Map<
 		replyToMessageId?: number
 		translate?: boolean
 		sponsor?: boolean
+		sponsorCategories?: string[]
 	}
 >()
 
 const buildTaskKeyboard = (prefix: string) => {
 	return new InlineKeyboard().text("Да", `${prefix}:yes`).text("Нет", `${prefix}:no`)
+}
+
+const buildSponsorCategoriesKeyboard = () => {
+	return new InlineKeyboard()
+		.text("Только рекламную часть", "task:sponsor_categories:sponsor")
+		.row()
+		.text("Все фрагменты", "task:sponsor_categories:all")
 }
 
 const enqueueTranslateJob = async (
@@ -7189,14 +7220,19 @@ const enqueueTaskJob = async (
 	ctx: any,
 	userId: number,
 	rawUrl: string,
-	options: { translate: boolean; sponsor: boolean },
+	options: { translate: boolean; sponsor: boolean; sponsorCategories?: string[] },
 	replyToMessageId?: number,
 ) => {
 	const sourceUrl = normalizeVimeoUrl(rawUrl)
 	let sponsorCutRequested = options.sponsor
+	let sponsorCategories = options.sponsorCategories
 	if (sponsorCutRequested && !isYouTubeUrl(sourceUrl)) {
 		sponsorCutRequested = false
+		sponsorCategories = undefined
 		await ctx.reply("SponsorBlock доступен только для YouTube. Продолжаем без вырезания.")
+	}
+	if (sponsorCutRequested && (!sponsorCategories || sponsorCategories.length === 0)) {
+		sponsorCategories = SPONSORBLOCK_DEFAULT_CATEGORIES
 	}
 	void logUserLink(userId, sourceUrl, "requested")
 	const lockResult = lockUserUrl(userId, sourceUrl)
@@ -7218,6 +7254,7 @@ const enqueueTaskJob = async (
 					replyToMessageId,
 					signal,
 					sponsorCutRequested,
+					sponsorCategories,
 				})
 			} catch (error) {
 				if (isTranslationUnsupportedError(error)) {
@@ -7276,6 +7313,7 @@ const enqueueTaskJob = async (
 			false,
 			undefined,
 			sponsorCutRequested,
+			sponsorCategories,
 		)
 	})
 }
@@ -7338,10 +7376,14 @@ bot.command("task", async (ctx) => {
 		try {
 			await ctx.api.deleteMessage(previousPrompt.chatId, previousPrompt.messageId)
 		} catch {}
-		userPromptMessages.delete(userId)
+	userPromptMessages.delete(userId)
 	}
 	userState.delete(userId)
-	taskOptions.set(userId, { translate: undefined, sponsor: undefined })
+	taskOptions.set(userId, {
+		translate: undefined,
+		sponsor: undefined,
+		sponsorCategories: undefined,
+	})
 	userState.set(userId, "waiting_for_task_url")
 	const prompt = await ctx.reply("Пришлите ссылку на видео.")
 	userPromptMessages.set(userId, { chatId: ctx.chat.id, messageId: prompt.message_id })
@@ -7637,6 +7679,7 @@ bot.on("message:text", async (ctx, next) => {
 			replyToMessageId,
 			translate: undefined,
 			sponsor: undefined,
+			sponsorCategories: undefined,
 		})
 		return
 	}
@@ -8226,7 +8269,63 @@ bot.on("callback_query:data", async (ctx) => {
 				show_alert: true,
 			})
 		}
-		const updated = { ...current, sponsor }
+		if (!sponsor) {
+			const updated = { ...current, sponsor: false, sponsorCategories: undefined }
+			taskOptions.set(userId, updated)
+			userState.delete(userId)
+			userPromptMessages.delete(userId)
+			const replyToMessageId = updated.replyToMessageId
+			const url = updated.url
+			taskOptions.delete(userId)
+			try {
+				await ctx.editMessageText("Ставим задачу в очередь...", {
+					reply_markup: new InlineKeyboard(),
+				})
+			} catch {}
+			await enqueueTaskJob(
+				ctx,
+				userId,
+				url,
+				{
+					translate: updated.translate ?? false,
+					sponsor: updated.sponsor ?? false,
+					sponsorCategories: updated.sponsorCategories,
+				},
+				replyToMessageId,
+			)
+			return await ctx.answerCallbackQuery({ text: "Ок" })
+		}
+
+		taskOptions.set(userId, {
+			...current,
+			sponsor: true,
+			sponsorCategories: undefined,
+		})
+		try {
+			await ctx.editMessageText("Что вырезать по SponsorBlock?", {
+				reply_markup: buildSponsorCategoriesKeyboard(),
+			})
+		} catch {}
+		return await ctx.answerCallbackQuery({ text: "Ок" })
+	}
+	if (data.startsWith("task:sponsor_categories:")) {
+		const userId = ctx.from?.id
+		if (!userId) return await ctx.answerCallbackQuery()
+		const value = data.split(":")[2]
+		const current = taskOptions.get(userId)
+		if (!current?.url) {
+			return await ctx.answerCallbackQuery({
+				text: "Ссылка устарела. Повторите /task.",
+				show_alert: true,
+			})
+		}
+		const sponsorCategories =
+			value === "all" ? SPONSORBLOCK_ALL_CATEGORIES : SPONSORBLOCK_DEFAULT_CATEGORIES
+		const updated = {
+			...current,
+			sponsor: true,
+			sponsorCategories,
+		}
 		taskOptions.set(userId, updated)
 		userState.delete(userId)
 		userPromptMessages.delete(userId)
@@ -8245,6 +8344,7 @@ bot.on("callback_query:data", async (ctx) => {
 			{
 				translate: updated.translate ?? false,
 				sponsor: updated.sponsor ?? false,
+				sponsorCategories: updated.sponsorCategories,
 			},
 			replyToMessageId,
 		)

@@ -72,14 +72,12 @@ const defaultCommands = [
 
 const privateCommands = [
 	...defaultCommands,
-	{ command: "translate", description: "Перевести видео" },
 ]
 
 const adminCommands = [
 	{ command: "formats", description: "Показать доступные форматы" },
 	{ command: "task", description: "Интерактивная загрузка" },
 	{ command: "cancel", description: "Отменить все задания" },
-	{ command: "translate", description: "Перевести видео" },
 	{ command: "cookie", description: "Upload cookies info" },
 	{ command: "clear", description: "Clear cookies" },
 	{ command: "proxy", description: "Set proxy for yt-dlp" },

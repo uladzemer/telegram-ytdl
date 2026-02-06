@@ -1307,6 +1307,76 @@ const buildKeepRanges = (segments: Array<[number, number]>, duration: number) =>
 	return keep
 }
 
+const trimVideoByRangesFilterFallback = async (
+	inputPath: string,
+	ranges: Array<[number, number]>,
+	outputPath: string,
+	container: string,
+	signal?: AbortSignal,
+) => {
+	const chunks: string[] = []
+	const concatInputs: string[] = []
+	for (const [index, [start, end]] of ranges.entries()) {
+		chunks.push(
+			`[0:v:0]trim=start=${start}:end=${end},setpts=PTS-STARTPTS[v${index}]`,
+		)
+		chunks.push(
+			`[0:a:0]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS[a${index}]`,
+		)
+		concatInputs.push(`[v${index}][a${index}]`)
+	}
+	chunks.push(
+		`${concatInputs.join("")}concat=n=${ranges.length}:v=1:a=1[vout][aout]`,
+	)
+	const args = [
+		"-y",
+		"-i",
+		inputPath,
+		"-filter_complex",
+		chunks.join(";"),
+		"-map",
+		"[vout]",
+		"-map",
+		"[aout]",
+	]
+	if (container === "webm") {
+		args.push(
+			"-c:v",
+			"libvpx-vp9",
+			"-crf",
+			"33",
+			"-b:v",
+			"0",
+			"-row-mt",
+			"1",
+			"-cpu-used",
+			"4",
+			"-c:a",
+			"libopus",
+			"-b:a",
+			"128k",
+		)
+	} else {
+		args.push(
+			"-c:v",
+			"libx264",
+			"-preset",
+			"veryfast",
+			"-crf",
+			"23",
+			"-c:a",
+			"aac",
+			"-b:a",
+			"160k",
+		)
+		if (container === "mp4") {
+			args.push("-movflags", "+faststart")
+		}
+	}
+	args.push(outputPath)
+	await spawnPromise("ffmpeg", args, undefined, signal)
+}
+
 const trimVideoByRanges = async (
 	inputPath: string,
 	ranges: Array<[number, number]>,
@@ -1314,8 +1384,14 @@ const trimVideoByRanges = async (
 	container: string,
 	signal?: AbortSignal,
 ) => {
+	const validRanges = ranges.filter(
+		([start, end]) => Number.isFinite(start) && Number.isFinite(end) && end - start >= 0.35,
+	)
+	if (validRanges.length === 0) {
+		throw new Error("No valid ranges for SponsorBlock trim")
+	}
 	const partFiles: string[] = []
-	for (const [index, [start, end]] of ranges.entries()) {
+	for (const [index, [start, end]] of validRanges.entries()) {
 		const partPath = `${inputPath}.sb_part_${index}.${container}`
 		const args = [
 			"-y",
@@ -1337,17 +1413,119 @@ const trimVideoByRanges = async (
 		}
 		args.push(partPath)
 		await spawnPromise("ffmpeg", args, undefined, signal)
-		partFiles.push(partPath)
+		if (await fileExists(partPath, 1024)) {
+			partFiles.push(partPath)
+		}
+	}
+	if (partFiles.length === 0) {
+		throw new Error("SponsorBlock trim produced no valid parts")
+	}
+	if (partFiles.length === 1) {
+		await spawnPromise("ffmpeg", ["-y", "-i", partFiles[0], "-c", "copy", outputPath], undefined, signal)
+		try {
+			await unlink(partFiles[0])
+		} catch {}
+		return
 	}
 	const concatPath = `${inputPath}.sb_concat.txt`
 	const concatContent = partFiles.map((file) => `file '${file.replace(/'/g, "'\\''")}'`).join("\n")
 	await writeFile(concatPath, concatContent)
-	const concatArgs = ["-y", "-f", "concat", "-safe", "0", "-i", concatPath, "-c", "copy"]
+	const concatArgs = [
+		"-y",
+		"-f",
+		"concat",
+		"-safe",
+		"0",
+		"-fflags",
+		"+genpts",
+		"-avoid_negative_ts",
+		"make_zero",
+		"-i",
+		concatPath,
+		"-c",
+		"copy",
+	]
 	if (container === "mp4") {
 		concatArgs.push("-movflags", "+faststart")
 	}
 	concatArgs.push(outputPath)
-	await spawnPromise("ffmpeg", concatArgs, undefined, signal)
+	try {
+		await spawnPromise("ffmpeg", concatArgs, undefined, signal)
+	} catch (copyConcatError) {
+		console.warn("[WARN] SponsorBlock: concat copy failed, retrying with re-encode", {
+			container,
+			error:
+				copyConcatError instanceof Error
+					? copyConcatError.message
+					: String(copyConcatError),
+		})
+		const reencodeArgs = [
+			"-y",
+			"-f",
+			"concat",
+			"-safe",
+			"0",
+			"-fflags",
+			"+genpts",
+			"-avoid_negative_ts",
+			"make_zero",
+			"-i",
+			concatPath,
+		]
+		if (container === "webm") {
+			reencodeArgs.push(
+				"-c:v",
+				"libvpx-vp9",
+				"-crf",
+				"33",
+				"-b:v",
+				"0",
+				"-row-mt",
+				"1",
+				"-cpu-used",
+				"4",
+				"-c:a",
+				"libopus",
+				"-b:a",
+				"128k",
+			)
+		} else {
+			reencodeArgs.push(
+				"-c:v",
+				"libx264",
+				"-preset",
+				"veryfast",
+				"-crf",
+				"23",
+				"-c:a",
+				"aac",
+				"-b:a",
+				"160k",
+			)
+			if (container === "mp4") {
+				reencodeArgs.push("-movflags", "+faststart")
+			}
+		}
+		reencodeArgs.push(outputPath)
+		try {
+			await spawnPromise("ffmpeg", reencodeArgs, undefined, signal)
+		} catch (reencodeConcatError) {
+			console.warn("[WARN] SponsorBlock: concat re-encode failed, retrying trim via filter_complex", {
+				container,
+				error:
+					reencodeConcatError instanceof Error
+						? reencodeConcatError.message
+						: String(reencodeConcatError),
+			})
+			await trimVideoByRangesFilterFallback(
+				inputPath,
+				validRanges,
+				outputPath,
+				container,
+				signal,
+			)
+		}
+	}
 	for (const file of partFiles) {
 		try {
 			await unlink(file)
@@ -1841,6 +2019,308 @@ const resolveTiktokShortUrl = async (url: string) => {
 	}
 }
 
+const facebookShareMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (host === "fb.watch") return true
+		if (host.endsWith("facebook.com")) {
+			const path = parsed.pathname.toLowerCase()
+			if (path.startsWith("/share/")) return true
+			if (path === "/share.php" || path === "/sharer.php") return true
+			if (path === "/story.php") return true
+		}
+		return false
+	} catch {
+		return false
+	}
+}
+
+const facebookShareReelMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.toLowerCase().endsWith("facebook.com")) return false
+		return parsed.pathname.toLowerCase().startsWith("/share/r/")
+	} catch {
+		return false
+	}
+}
+
+const unwrapFacebookRedirectUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (host.endsWith("facebook.com") && parsed.pathname === "/l.php") {
+			const target = parsed.searchParams.get("u")
+			if (target) return target
+		}
+		return url
+	} catch {
+		return url
+	}
+}
+
+const isFacebookLoginUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("facebook.com")) return false
+		const path = parsed.pathname.toLowerCase()
+		return (
+			path.startsWith("/login") ||
+			path === "/login.php" ||
+			path.includes("/checkpoint/") ||
+			path.startsWith("/privacy/consent")
+		)
+	} catch {
+		return false
+	}
+}
+
+const extractFacebookLoginTarget = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("facebook.com")) return undefined
+		const next = parsed.searchParams.get("next")
+		const cont = parsed.searchParams.get("continue")
+		const target = next || cont
+		if (target) return target
+		return undefined
+	} catch {
+		return undefined
+	}
+}
+
+const extractFacebookStoryFbid = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		return parsed.searchParams.get("story_fbid") || undefined
+	} catch {
+		return undefined
+	}
+}
+
+const extractFacebookStoryTargetFromLoginUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("facebook.com")) return undefined
+		const next = parsed.searchParams.get("next")
+		const cont = parsed.searchParams.get("continue")
+		const target = next || cont
+		if (!target) return undefined
+		const unwrapped = unwrapFacebookRedirectUrl(target)
+		const storyFbid = extractFacebookStoryFbid(unwrapped)
+		if (!storyFbid) return undefined
+		return {
+			storyFbid,
+			target: unwrapped,
+		}
+	} catch {
+		return undefined
+	}
+}
+
+const extractFacebookExpectedStoryFbid = (url: string) => {
+	return (
+		extractFacebookStoryFbid(url) ||
+		extractFacebookStoryTargetFromLoginUrl(url)?.storyFbid ||
+		undefined
+	)
+}
+
+const extractFacebookMetaUrl = (html: string) => {
+	const patterns = [
+		/property=["']og:url["'][^>]*content=["']([^"']+)["']/i,
+		/content=["']([^"']+)["'][^>]*property=["']og:url["']/i,
+		/rel=["']canonical["'][^>]*href=["']([^"']+)["']/i,
+		/href=["']([^"']+)["'][^>]*rel=["']canonical["']/i,
+		/property=["']al:web:url["'][^>]*content=["']([^"']+)["']/i,
+		/content=["']([^"']+)["'][^>]*property=["']al:web:url["']/i,
+	]
+	for (const pattern of patterns) {
+		const match = html.match(pattern)
+		if (match?.[1]) return match[1].replace(/&amp;/g, "&").trim()
+	}
+	return undefined
+}
+
+const resolveFacebookShareUrlViaCurl = async (url: string) => {
+	const proxy = await readProxyValue()
+	const proxyArgs = proxy ? ["--proxy", proxy] : []
+	let cookieArgs: string[] = []
+	try {
+		const stats = await stat(COOKIE_FILE)
+		if (stats.isFile()) {
+			cookieArgs = ["-b", COOKIE_FILE]
+		}
+	} catch {}
+	const args = [
+		"-sS",
+		"-L",
+		"-o",
+		"/dev/null",
+		"-w",
+		"%{url_effective}",
+		"-A",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		...proxyArgs,
+		...cookieArgs,
+		url,
+	]
+	try {
+		const { stdout } = await execFilePromise("curl", args, { timeout: 8000 })
+		const resolved = stdout.trim()
+		if (!resolved) return url
+		if (isFacebookLoginUrl(resolved)) {
+			const loginTarget = extractFacebookLoginTarget(resolved)
+			if (loginTarget) {
+				const target = unwrapFacebookRedirectUrl(loginTarget)
+				if (target && !isFacebookLoginUrl(target)) {
+					return cleanUrl(target)
+				}
+			}
+		}
+		if (!facebookShareMatcher(resolved) && !isFacebookLoginUrl(resolved)) {
+			return cleanUrl(unwrapFacebookRedirectUrl(resolved))
+		}
+		return url
+	} catch (e) {
+		console.warn("Facebook share curl resolve error", e)
+		return url
+	}
+}
+
+const resolveFacebookShareUrl = async (url: string) => {
+	if (!facebookShareMatcher(url) && !isFacebookLoginUrl(url)) return url
+	if (isFacebookLoginUrl(url)) {
+		const loginTarget = extractFacebookLoginTarget(url)
+		if (loginTarget) {
+			const target = unwrapFacebookRedirectUrl(loginTarget)
+			if (target && !isFacebookLoginUrl(target)) {
+				return cleanUrl(target)
+			}
+		}
+	}
+	const controller = new AbortController()
+	const timeout = setTimeout(() => controller.abort(), 6000)
+	try {
+		const res = await fetch(url, {
+			signal: controller.signal,
+			redirect: "follow",
+			headers: {
+				"User-Agent":
+					"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+				Accept: "text/html",
+			},
+		})
+		let resolved = res.url || url
+		resolved = unwrapFacebookRedirectUrl(resolved)
+		if (isFacebookLoginUrl(resolved)) {
+			const loginTarget = extractFacebookLoginTarget(resolved)
+			if (loginTarget) {
+				const target = unwrapFacebookRedirectUrl(loginTarget)
+				if (target && !isFacebookLoginUrl(target)) {
+					return cleanUrl(target)
+				}
+			}
+		}
+		if (
+			resolved &&
+			resolved !== url &&
+			!facebookShareMatcher(resolved) &&
+			!isFacebookLoginUrl(resolved)
+		) {
+			return cleanUrl(resolved)
+		}
+
+		const contentType = res.headers.get("content-type") || ""
+		if (contentType.includes("text/html")) {
+			const html = await res.text()
+			const metaUrl = extractFacebookMetaUrl(html)
+			if (metaUrl) {
+				const metaResolved = unwrapFacebookRedirectUrl(metaUrl)
+				if (isFacebookLoginUrl(metaResolved)) {
+					const loginTarget = extractFacebookLoginTarget(metaResolved)
+					if (loginTarget) {
+						const target = unwrapFacebookRedirectUrl(loginTarget)
+						if (target && !isFacebookLoginUrl(target)) {
+							return cleanUrl(target)
+						}
+					}
+				} else {
+					return cleanUrl(metaResolved)
+				}
+			}
+		} else if (res.body) {
+			try {
+				await res.body.cancel()
+			} catch {}
+		}
+		return await resolveFacebookShareUrlViaCurl(url)
+	} catch (e) {
+		console.warn("Facebook share resolve error", e)
+		return await resolveFacebookShareUrlViaCurl(url)
+	} finally {
+		clearTimeout(timeout)
+	}
+}
+
+const facebookStoryMatcher = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		if (!parsed.hostname.endsWith("facebook.com")) return false
+		return parsed.pathname.toLowerCase() === "/story.php"
+	} catch {
+		return false
+	}
+}
+
+const resolveFacebookStory = async (url: string) => {
+	try {
+		const { stdout } = await execFilePromise("python3", [
+			"src/facebook_story_bypass.py",
+			url,
+			COOKIE_FILE,
+			PROXY_FILE,
+		])
+		const trimmed = stdout.trim()
+		if (!trimmed) return { error: "Empty response from facebook story resolver" }
+		return JSON.parse(trimmed)
+	} catch (e) {
+		console.error("Facebook story resolve error", e)
+		return { error: "Failed to run facebook story resolver" }
+	}
+}
+
+const isFacebookCdnVideoUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (!host.endsWith("fbcdn.net")) return false
+		return parsed.pathname.toLowerCase().includes(".mp4")
+	} catch {
+		return false
+	}
+}
+
+const normalizeFacebookCdnVideoUrl = (url: string) => {
+	try {
+		const parsed = new URL(url)
+		const host = parsed.hostname.toLowerCase()
+		if (!host.endsWith("fbcdn.net")) return url
+		if (!parsed.pathname.toLowerCase().includes(".mp4")) return url
+		let changed = false
+		for (const key of ["bytestart", "byteend"]) {
+			if (parsed.searchParams.has(key)) {
+				parsed.searchParams.delete(key)
+				changed = true
+			}
+		}
+		return changed ? parsed.toString() : url
+	} catch {
+		return url
+	}
+}
+
 const soraMatcher = (url: string) => url.includes("sora.chatgpt.com")
 
 const resolveSora = async (url: string) => {
@@ -2245,6 +2725,16 @@ const isAuthError = (error: unknown) => {
 	const message = error instanceof Error ? error.message : String(error)
 	return /http error 401|unauthorized|http error 403|forbidden/i.test(message)
 }
+
+const isFacebookTemporaryBlockError = (error: unknown) => {
+	const message = error instanceof Error ? error.message : String(error)
+	return /facebook temporarily blocked|you have been temporarily blocked|you used this feature too often|вы временно заблокированы|слишком часто использовали эту функцию|\[facebook\].*cannot parse data/i.test(
+		message,
+	)
+}
+
+const getFacebookTemporaryBlockMessage = () =>
+	"Facebook временно ограничил доступ к этой ссылке для текущего аккаунта/IP. Подождите 15-60 минут и попробуйте снова."
 
 const sleepMs = (ms: number) =>
 	new Promise((resolve) => setTimeout(resolve, ms))
@@ -2852,6 +3342,7 @@ const pickBestFormatUnderLimit = (
 	formats: any[],
 	duration: number | undefined,
 	maxBytes: number,
+	preferHls = false,
 ) => {
 	const entries = formats.map((format) => ({
 		format,
@@ -2866,22 +3357,22 @@ const pickBestFormatUnderLimit = (
 
 	if (candidates.length === 0) return undefined
 
-	const scored = candidates.map((item) => {
-		const { entry, size } = item
-		const resScore = Number(entry.format?.height || 0)
-		const hasAudio = entry.meta.hasAudio
-		const hasVideo = entry.meta.hasVideo
-		const score =
-			(hasVideo ? 1000 : 0) +
-			(hasAudio ? 500 : 0) +
-			(entry.meta.isHls ? 200 : 0) +
-			resScore +
-			Math.round((size || 0) / (1024 * 1024))
-		return { entry, size, score }
+	const muxed = candidates.filter(
+		(item) => item.entry.meta.hasVideo && item.entry.meta.hasAudio,
+	)
+	const basePool = muxed.length > 0 ? muxed : candidates
+	const hlsPool = preferHls
+		? basePool.filter((item) => item.entry.meta.isHls)
+		: []
+	const selectedPool = hlsPool.length > 0 ? hlsPool : basePool
+	selectedPool.sort((a, b) => {
+		const sizeDelta = (b.size || 0) - (a.size || 0)
+		if (sizeDelta !== 0) return sizeDelta
+		const aHeight = Number(a.entry.format?.height || 0)
+		const bHeight = Number(b.entry.format?.height || 0)
+		return bHeight - aHeight
 	})
-
-	scored.sort((a, b) => b.score - a.score)
-	return scored[0]
+	return selectedPool[0]
 }
 
 const buildFormatSuggestions = (
@@ -2889,6 +3380,7 @@ const buildFormatSuggestions = (
 	duration: number | undefined,
 	maxBytes: number,
 	limit = 3,
+	preferHls = false,
 ) => {
 	const entries = formats.map((format) => ({
 		format,
@@ -2900,7 +3392,16 @@ const buildFormatSuggestions = (
 			size: estimateFormatSize(entry.format, duration),
 		}))
 		.filter((item) => typeof item.size === "number" && item.size <= maxBytes)
-		.sort((a, b) => (b.size || 0) - (a.size || 0))
+		.sort((a, b) => {
+			if (preferHls && a.entry.meta.isHls !== b.entry.meta.isHls) {
+				return a.entry.meta.isHls ? -1 : 1
+			}
+			const sizeDelta = (a.size || 0) - (b.size || 0)
+			if (sizeDelta !== 0) return sizeDelta
+			const aHeight = Number(a.entry.format?.height || 0)
+			const bHeight = Number(b.entry.format?.height || 0)
+			return bHeight - aHeight
+		})
 
 	return candidates.slice(0, limit).map((item) => ({
 		entry: item.entry,
@@ -3213,8 +3714,55 @@ const downloadAndSend = async (
 	sponsorCategories?: string[],
 ) => {
 	url = normalizeVimeoUrl(url)
+	url = normalizeFacebookCdnVideoUrl(url)
+	let overrideTitleResolved = overrideTitle
 	if (sourceUrl) {
 		sourceUrl = normalizeVimeoUrl(sourceUrl)
+		sourceUrl = normalizeFacebookCdnVideoUrl(sourceUrl)
+	}
+	let expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(
+		sourceUrl || url,
+	)
+	const resolvedFacebookUrl = await resolveFacebookShareUrl(url)
+	if (resolvedFacebookUrl !== url) {
+		console.log(
+			`[DEBUG] Resolved Facebook share URL: ${url} -> ${resolvedFacebookUrl}`,
+		)
+		url = resolvedFacebookUrl
+	}
+	if (!expectedFacebookStoryFbid) {
+		expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(url)
+	}
+	if (facebookStoryMatcher(url)) {
+		const storyData = await resolveFacebookStory(url)
+		if (storyData.video_url) {
+			url = normalizeFacebookCdnVideoUrl(storyData.video_url)
+			if (!overrideTitleResolved && storyData.title) {
+				overrideTitleResolved = storyData.title
+			}
+		} else if (storyData.error) {
+			console.error("Facebook story error:", storyData.error)
+			if (isFacebookTemporaryBlockError(storyData.error)) {
+				throw new Error(getFacebookTemporaryBlockMessage())
+			}
+		}
+	}
+	if (facebookShareReelMatcher(url)) {
+		const storyData = await resolveFacebookStory(url)
+		if (storyData.video_url) {
+			url = normalizeFacebookCdnVideoUrl(storyData.video_url)
+			if (!overrideTitleResolved && storyData.title) {
+				overrideTitleResolved = storyData.title
+			}
+		} else if (storyData.error) {
+			console.error("Facebook story error:", storyData.error)
+			if (isFacebookTemporaryBlockError(storyData.error)) {
+				throw new Error(getFacebookTemporaryBlockMessage())
+			}
+			console.warn(
+				`[WARN] Facebook share/reel bypass failed, fallback to yt-dlp: ${storyData.error}`,
+			)
+		}
 	}
 	if (signal?.aborted) return
 	const tempBaseId = randomUUID()
@@ -3263,6 +3811,9 @@ const downloadAndSend = async (
 			]
 			: []
 		const resolveCaptionUrl = async (rawUrl: string) => {
+			if (facebookShareMatcher(rawUrl)) {
+				return await resolveFacebookShareUrl(rawUrl)
+			}
 			if (isTiktok && tiktokShortMatcher(rawUrl)) {
 				return await resolveTiktokShortUrl(rawUrl)
 			}
@@ -3271,6 +3822,34 @@ const downloadAndSend = async (
 		const refererArgs = shouldAttachReferer(sourceUrl || url)
 			? getRefererHeaderArgs(sourceUrl || url)
 			: []
+
+		if (
+			isFacebookCdnVideoUrl(url) &&
+			!externalAudio &&
+			!forceAudio &&
+			!selectedIsRawFormat &&
+			!forceHls
+		) {
+			const title = overrideTitleResolved || "Video"
+			const rawCaptionUrl = sourceUrl || url
+			const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
+			const caption = link(title, cleanUrl(captionUrl))
+			if (statusMessageId) {
+				await updateMessage(
+					ctx,
+					statusMessageId,
+					`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
+				)
+			}
+			await ctx.replyWithVideo(url, {
+				caption,
+				parse_mode: "HTML",
+				message_thread_id: threadId,
+				reply_to_message_id: replyToMessageId,
+				supports_streaming: true,
+			})
+			return
+		}
 
 		let isMp3Format = selectedIsRawFormat && selectedQuality === "mp3"
 		let isAudioRequest =
@@ -3307,7 +3886,7 @@ const downloadAndSend = async (
 						quality,
 						isRawFormat,
 						processing.message_id,
-						entry.title || overrideTitle,
+						entry.title || overrideTitleResolved,
 						replyToMessageId,
 						signal,
 						forceAudio,
@@ -3322,7 +3901,7 @@ const downloadAndSend = async (
 		}
 
 		if (isDirectHls && !isAudioRequest) {
-			const title = overrideTitle || "Video"
+			const title = overrideTitleResolved || "Video"
 			const rawCaptionUrl = sourceUrl || url
 			const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
 			const caption = link(title, cleanUrl(captionUrl))
@@ -3416,11 +3995,11 @@ const downloadAndSend = async (
 				if (isYouTube) {
 					formatArgs = [
 						"-f",
-						"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+						"bestvideo[protocol=https][vcodec^=avc1][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
 					]
 					fallbackFormatArgs = [
 						"-f",
-						"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+						"best[protocol*=m3u8][vcodec^=avc1][acodec^=mp4a]/best[protocol*=m3u8][vcodec^=avc1]/bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 					]
 				} else if (isVimeo) {
 					formatArgs = ["-f", "bestvideo+bestaudio/best"]
@@ -3437,11 +4016,11 @@ const downloadAndSend = async (
 				if (isYouTube) {
 					formatArgs = [
 						"-f",
-						`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
+						`bestvideo[protocol=https][height<=${selectedQuality}][vcodec^=avc1][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
 					]
 					fallbackFormatArgs = [
 						"-f",
-						`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+						`best[height<=${selectedQuality}][protocol*=m3u8][vcodec^=avc1][acodec^=mp4a]/best[height<=${selectedQuality}][protocol*=m3u8][vcodec^=avc1]/bestvideo[height<=${selectedQuality}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
 					]
 				} else if (isVimeo) {
 					formatArgs = [
@@ -3468,10 +4047,7 @@ const downloadAndSend = async (
 			await updateMessage(ctx, statusMessageId, "Получаем информацию о видео...")
 		}
 
-		const skipJsRuntimeForInfo =
-			isYouTube &&
-			(forceHlsDownload ||
-				formatArgs.some((arg) => arg.includes("protocol*=m3u8")))
+		const skipJsRuntimeForInfo = false
 		const fallbackSourceUrl = sourceUrl || url
 		const genericFallbacks = shouldTryGenericFallback(fallbackSourceUrl)
 			? buildGenericFallbacks(fallbackSourceUrl)
@@ -3564,8 +4140,19 @@ const downloadAndSend = async (
 			}
 		}
 
-		const resolvedTitle = resolveTitle(info, isTiktok)
-		const title = overrideTitle || resolvedTitle
+		const infoResolvedTitle = resolveTitle(info, isTiktok)
+		if (expectedFacebookStoryFbid && typeof info?.webpage_url === "string") {
+			const actualFacebookStoryFbid = extractFacebookStoryFbid(info.webpage_url)
+			if (
+				actualFacebookStoryFbid &&
+				actualFacebookStoryFbid !== expectedFacebookStoryFbid
+			) {
+				throw new Error(
+					`Facebook story mismatch: expected story_fbid=${expectedFacebookStoryFbid}, got story_fbid=${actualFacebookStoryFbid}`,
+				)
+			}
+		}
+		const title = overrideTitleResolved || infoResolvedTitle
 		const rawCaptionUrl = sourceUrl || url
 		const captionUrl = await resolveCaptionUrl(rawCaptionUrl)
 		const captionBase = link(title || "Video", cleanUrl(captionUrl))
@@ -3582,13 +4169,10 @@ const downloadAndSend = async (
 			: ""
 		const dashFileBase = formatTail ? `${safeTitle}_${formatTail}` : ""
 		const maxUploadSize = 2 * 1024 * 1024 * 1024
-		const sizeCandidates: number[] = []
-		if (typeof info.filesize === "number") sizeCandidates.push(info.filesize)
-		if (typeof info.filesize_approx === "number")
-			sizeCandidates.push(info.filesize_approx)
+		const formatsArray: any[] = Array.isArray(info.formats) ? info.formats : []
+		let requestedFormatsSummed = 0
+		let hasRequestedFormatsSize = false
 		if (Array.isArray(info.requested_formats)) {
-			let summed = 0
-			let hasSize = false
 			for (const format of info.requested_formats) {
 				const formatSize =
 					typeof format?.filesize === "number"
@@ -3597,67 +4181,106 @@ const downloadAndSend = async (
 							? format.filesize_approx
 							: 0
 				if (formatSize > 0) {
+					requestedFormatsSummed += formatSize
+					hasRequestedFormatsSize = true
+				}
+			}
+		}
+		const selectedRawSize = (() => {
+			if (!selectedIsRawFormat || !selectedQuality) return 0
+			const selectedIds = `${selectedQuality}`
+				.split("+")
+				.map((id) => id.trim())
+				.filter(Boolean)
+			if (selectedIds.length === 0) return 0
+			let summed = 0
+			let hasSize = false
+			for (const selectedId of selectedIds) {
+				const format = formatsArray.find(
+					(item: { format_id?: string | number }) =>
+						`${item?.format_id ?? ""}` === selectedId,
+				)
+				if (!format) continue
+				const formatSize = estimateFormatSize(format, infoDuration)
+				if (typeof formatSize === "number" && formatSize > 0) {
 					summed += formatSize
 					hasSize = true
 				}
 			}
-			if (hasSize) sizeCandidates.push(summed)
-		}
-		const estimatedSize = sizeCandidates.length
-			? Math.max(...sizeCandidates)
-			: 0
+			return hasSize ? summed : 0
+		})()
+		const estimatedSize =
+			selectedRawSize ||
+			(hasRequestedFormatsSize ? requestedFormatsSummed : 0) ||
+			(typeof info.filesize === "number" ? info.filesize : 0) ||
+			(typeof info.filesize_approx === "number" ? info.filesize_approx : 0)
 		let estimatedSizeLabel = estimatedSize ? formatBytes(estimatedSize) : ""
 
-		let maxEstimatedFromFormats = 0
-			const formatsArray: any[] = Array.isArray(info.formats) ? info.formats : []
-		for (const format of formatsArray) {
-			const size = estimateFormatSize(format, infoDuration)
-			if (typeof size === "number" && size > maxEstimatedFromFormats) {
-				maxEstimatedFromFormats = size
-			}
-		}
-
-		if (estimatedSize >= maxUploadSize || maxEstimatedFromFormats >= maxUploadSize) {
+			if (estimatedSize > 0 && estimatedSize >= maxUploadSize) {
 			const suggestions = buildFormatSuggestions(
 				formatsArray,
 				infoDuration,
 				maxUploadSize,
+				8,
+				isYouTube,
 			)
-			const bestAlt = pickBestFormatUnderLimit(
-				formatsArray,
-				infoDuration,
-				maxUploadSize,
-			)
-			if (bestAlt) {
-				const altLabel = getFormatSuggestionLabel(bestAlt.entry, bestAlt.size)
-				selectedQuality = `${bestAlt.entry.format.format_id}`
-				selectedIsRawFormat = true
-				selectedForceHls = bestAlt.entry.meta.isHls
-				selectedFormatLabelTail = altLabel
-				if (typeof bestAlt.size === "number") {
-					estimatedSizeLabel = formatBytes(bestAlt.size)
+			if (suggestions.length > 0) {
+				const requestId = randomUUID().split("-")[0]
+				const filteredFormats = formatsArray.filter((f: any) => f?.format_id)
+				if (!requestId || filteredFormats.length === 0) {
+					throw new Error("Failed to prepare alternative format selector")
 				}
-				const suggestionText = suggestions.length
-					? `\nДругие варианты ≤2ГБ:\n${suggestions.map((s) => `• ${s.label}`).join("\n")}`
-					: ""
+				const titleForMenu = title || info.title || "video"
+				requestCache.set(requestId, {
+					url,
+					sourceUrl: sourceUrl || url,
+					title: titleForMenu,
+					formats: filteredFormats,
+					userId: ctx.from?.id,
+					externalAudioUrl,
+				})
+				scheduleRequestExpiry(requestId)
+
+				const keyboard = new InlineKeyboard()
+				for (const suggestion of suggestions) {
+					const formatId = `${suggestion.entry.format?.format_id ?? ""}`.trim()
+					if (!formatId) continue
+					const buttonText =
+						suggestion.label.length > 60
+							? `${suggestion.label.substring(0, 57)}...`
+							: suggestion.label
+					keyboard.text(buttonText, `d:${requestId}:${formatId}`).row()
+				}
+				keyboard
+					.text("Показать все HLS", `f:${requestId}:hls`)
+					.text("Отмена", `d:${requestId}:cancel`)
+
+				const oversizeMessage =
+					`Файл слишком большой для Telegram (> ${formatBytes(maxUploadSize)}).\n` +
+					"Выберите альтернативный формат кнопками ниже."
 				if (statusMessageId) {
-					await updateMessage(
-						ctx,
-						statusMessageId,
-						`Файл слишком большой для Telegram (${formatBytes(maxUploadSize)}). Берём вариант: ${altLabel}${suggestionText}`,
-					)
+					await updateMessage(ctx, statusMessageId, oversizeMessage)
+					await ctx.reply(`Альтернативные варианты для: ${titleForMenu}`, {
+						reply_markup: keyboard,
+						message_thread_id: threadId,
+					})
 				} else if (ctx.callbackQuery) {
-					await ctx.editMessageText(
-						`Файл слишком большой для Telegram (${formatBytes(maxUploadSize)}). Берём вариант: ${altLabel}${suggestionText}`,
-					)
+					await ctx.editMessageText(oversizeMessage, {
+						reply_markup: keyboard,
+					})
+				} else {
+					await ctx.reply(`Альтернативные варианты для: ${titleForMenu}`, {
+						reply_markup: keyboard,
+						message_thread_id: threadId,
+					})
 				}
-			} else {
-				const suggestionText = suggestions.length
-					? `\nДоступные варианты ≤2ГБ:\n${suggestions.map((s) => `• ${s.label}`).join("\n")}`
-					: ""
+				return
+			}
+			{
+				const suggestionsText = "\nНе удалось подобрать варианты с оценкой размера."
 				const limitMessage =
 					"Можно загрузить файлы до 2ГБ." +
-					suggestionText +
+					suggestionsText +
 					"\nИспользуйте /formats для выбора."
 				if (statusMessageId) {
 					await updateMessage(ctx, statusMessageId, limitMessage)
@@ -3689,11 +4312,11 @@ const downloadAndSend = async (
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
-					"bestvideo[protocol=https][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
+					"bestvideo[protocol=https][vcodec^=avc1][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][ext=mp4]/best[protocol=https]",
 				]
 				fallbackFormatArgs = [
 					"-f",
-					"best[protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[protocol*=m3u8][vcodec~='^avc1']/bestvideo[vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+					"best[protocol*=m3u8][vcodec^=avc1][acodec^=mp4a]/best[protocol*=m3u8][vcodec^=avc1]/bestvideo[vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
 				]
 			} else if (isVimeo) {
 				formatArgs = ["-f", "bestvideo+bestaudio/best"]
@@ -3710,11 +4333,11 @@ const downloadAndSend = async (
 			if (isYouTube) {
 				formatArgs = [
 					"-f",
-					`bestvideo[protocol=https][height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
+					`bestvideo[protocol=https][height<=${selectedQuality}][vcodec^=avc1][ext=mp4]+bestaudio[protocol=https][ext=m4a]/best[protocol=https][height<=${selectedQuality}][ext=mp4]/best[protocol=https][height<=${selectedQuality}]`,
 				]
 				fallbackFormatArgs = [
 					"-f",
-					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1'][acodec~='^mp4a']/best[height<=${selectedQuality}][protocol*=m3u8][vcodec~='^avc1']/bestvideo[height<=${selectedQuality}][vcodec~='^avc1'][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
+					`best[height<=${selectedQuality}][protocol*=m3u8][vcodec^=avc1][acodec^=mp4a]/best[height<=${selectedQuality}][protocol*=m3u8][vcodec^=avc1]/bestvideo[height<=${selectedQuality}][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/best[height<=${selectedQuality}][ext=mp4]/best[height<=${selectedQuality}]`,
 				]
 			} else if (isVimeo) {
 				formatArgs = [
@@ -3985,7 +4608,7 @@ const downloadAndSend = async (
 				} catch {}
 			}
 		} else {
-			const skipJsRuntime = isYouTube && isHlsDownload
+				const skipJsRuntime = false
 			const downloadArgs =
 				formatArgs.includes("--js-runtimes") || skipJsRuntime
 					? formatArgs
@@ -4227,19 +4850,19 @@ const downloadAndSend = async (
 					? lastError
 					: new Error("Download failed")
 			}
-			if (isYouTube && isHlsDownload) {
-				const hlsAttempts = [
-					{
-						label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем без cookies...`,
-						extraArgs: [...hlsPoTokenArgs],
-						cookies: [] as string[],
-					},
-					{
-						label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем с cookies...`,
-						extraArgs: [...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
-						cookies: cookieArgsList,
-					},
-				]
+				if (isYouTube && isHlsDownload) {
+					const hlsAttempts = [
+						{
+							label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем с cookies...`,
+							extraArgs: [...hlsPoTokenArgs, ...impersonateArgs, ...youtubeArgs],
+							cookies: cookieArgsList,
+						},
+						{
+							label: `Обработка: <b>${title}</b>\nСтатус: HLS: пробуем без cookies...`,
+							extraArgs: [...hlsPoTokenArgs],
+							cookies: [] as string[],
+						},
+					]
 				if (proxyArgs.length > 0) {
 					hlsAttempts.push(
 						{
@@ -4296,6 +4919,72 @@ const downloadAndSend = async (
 						}
 					}
 					if (downloadSucceeded) break
+				}
+				if (!downloadSucceeded) {
+					const nextHlsFormats = formatsArray
+						.map((format) => ({
+							format,
+							meta: getFormatMeta(format),
+							size: estimateFormatSize(format, infoDuration),
+						}))
+						.filter(
+							(item) =>
+								item.meta.isHls &&
+								item.meta.hasVideo &&
+								item.meta.hasAudio &&
+								typeof item.size === "number" &&
+								item.size > 0 &&
+								item.size <= maxUploadSize &&
+								`${item.format?.format_id ?? ""}` !== `${selectedQuality ?? ""}`,
+						)
+						.sort((a, b) => (b.size || 0) - (a.size || 0))
+
+					for (const nextHls of nextHlsFormats) {
+						const nextHlsId = `${nextHls.format?.format_id ?? ""}`.trim()
+						if (!nextHlsId) continue
+						const nextHlsLabel = getFormatSuggestionLabel(
+							{ format: nextHls.format, meta: nextHls.meta },
+							nextHls.size,
+						)
+						const explicitArgs = buildExplicitFormatArgs(nextHlsId)
+						const explicitDownloadArgs =
+							explicitArgs.includes("--js-runtimes") || skipJsRuntime
+								? explicitArgs
+								: [...jsRuntimeArgs, ...explicitArgs]
+						if (statusMessageId) {
+							await updateMessage(
+								ctx,
+								statusMessageId,
+								`Обработка: <b>${title}</b>\nСтатус: HLS недоступен, пробуем ${nextHlsLabel}...`,
+							)
+						}
+						try {
+							fileSize = ""
+							downloadedSize = ""
+							progressText = "Скачиваем..."
+							await runDownload(
+								explicitDownloadArgs,
+								[
+									...hlsPoTokenArgs,
+									...impersonateArgs,
+									...youtubeArgs,
+									...refererArgs,
+								],
+								cookieArgsList,
+							)
+							selectedQuality = nextHlsId
+							selectedIsRawFormat = true
+							selectedForceHls = true
+							selectedFormatLabelTail = nextHlsLabel
+							if (typeof nextHls.size === "number") {
+								estimatedSizeLabel = formatBytes(nextHls.size)
+							}
+							downloadSucceeded = true
+							break
+						} catch (nextHlsError) {
+							lastDownloadError = nextHlsError
+						}
+					}
 				}
 			} else {
 				if (isVimeo) {
@@ -4376,6 +5065,9 @@ const downloadAndSend = async (
 							if (isVimeo) {
 								await runDownloadWithCookies(explicitDownloadArgs)
 							} else {
+								fileSize = ""
+								downloadedSize = ""
+								progressText = "Скачиваем..."
 								await runDownload(
 									explicitDownloadArgs,
 									[
@@ -4411,6 +5103,9 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: HLS недоступен, пробуем другое...`,
 					)
 				}
+				fileSize = ""
+				downloadedSize = ""
+				progressText = "Скачиваем..."
 				if (isVimeo) {
 					await runDownloadWithCookies(retryArgs)
 				} else {
@@ -4691,16 +5386,31 @@ const downloadAndSend = async (
 										tempDir,
 										`${sbBase}_sb.${outputContainer}`,
 									)
-									await trimVideoByRanges(
-										tempFilePath,
-										keepRanges,
-										trimmedPath,
-										outputContainer,
-										signal,
-									)
-									if (await fileExists(trimmedPath, 1024)) {
-										tempFilePath = trimmedPath
-									}
+										await trimVideoByRanges(
+											tempFilePath,
+											keepRanges,
+											trimmedPath,
+											outputContainer,
+											signal,
+										)
+										if (await fileExists(trimmedPath, 1024)) {
+											try {
+												const trimmedMeta = await getVideoMetadata(trimmedPath)
+												if (trimmedMeta.duration > 0) {
+													tempFilePath = trimmedPath
+												} else {
+													console.warn(
+														"[WARN] SponsorBlock: trimmed file has invalid duration, keeping original",
+														{ path: trimmedPath },
+													)
+												}
+											} catch (trimmedMetaError) {
+												console.warn(
+													"[WARN] SponsorBlock: trimmed file metadata check failed, keeping original",
+													trimmedMetaError,
+												)
+											}
+										}
 								}
 							}
 						}
@@ -4834,7 +5544,9 @@ const downloadAndSend = async (
 			ctx.from,
 			ctx.message,
 		)
-				const msg = "Ошибка."
+				const msg = isFacebookTemporaryBlockError(error)
+					? getFacebookTemporaryBlockMessage()
+					: "Ошибка."
 				if (statusMessageId) {
 					await updateMessage(ctx, statusMessageId, msg)
 				} else if (ctx.callbackQuery) {
@@ -4879,11 +5591,19 @@ const runTranslatedDownload = async (params: {
 		sponsorCategories,
 	} = params
 	const translateTarget = sourceUrl || url
+	const resolvedTranslateTarget = await resolveFacebookShareUrl(translateTarget)
+	const translateUrl =
+		resolvedTranslateTarget !== translateTarget ? resolvedTranslateTarget : translateTarget
+	if (translateUrl !== translateTarget) {
+		console.log(
+			`[DEBUG] Resolved Facebook share URL for translate: ${translateTarget} -> ${translateUrl}`,
+		)
+	}
 	let audioUrl = externalAudioUrl
 	const startedAt = Date.now()
 	logTranslate("request", {
 		chat: ctx.chat?.id,
-		url: redactUrl(translateTarget),
+		url: redactUrl(translateUrl),
 		externalAudio: audioUrl ? redactUrl(audioUrl) : undefined,
 	})
 	try {
@@ -4897,7 +5617,7 @@ const runTranslatedDownload = async (params: {
 					}),
 				)
 			}
-			audioUrl = await translateWithVot(translateTarget, ctx, statusMessageId, signal)
+			audioUrl = await translateWithVot(translateUrl, ctx, statusMessageId, signal)
 		}
 		await downloadAndSend(
 			ctx,
@@ -4919,13 +5639,13 @@ const runTranslatedDownload = async (params: {
 		)
 		logTranslate("complete", {
 			chat: ctx.chat?.id,
-			url: redactUrl(translateTarget),
+			url: redactUrl(translateUrl),
 			totalSeconds: Math.round((Date.now() - startedAt) / 1000),
 		})
 	} catch (error) {
 		logTranslate("failed", {
 			chat: ctx.chat?.id,
-			url: redactUrl(translateTarget),
+			url: redactUrl(translateUrl),
 			error: error instanceof Error ? error.message : String(error),
 		})
 		throw error
@@ -5065,10 +5785,10 @@ bot.command("send", async (ctx) => {
 		await ctx.reply("Нужно ответить на сообщение с медиа.")
 		return
 	}
-	try {
-		await bot.api.copyMessage(targetId, replied.chat.id, replied.message_id)
-		await ctx.reply(`Отправлено пользователю ${code(String(targetId))}.`)
-	} catch (error) {
+		try {
+			await bot.api.copyMessage(targetId, replied.chat.id, replied.message_id)
+			await ctx.reply(`Отправлено пользователю.\nID: ${code(String(targetId))}`)
+		} catch (error) {
 		await ctx.reply("Не удалось отправить. Проверьте, что пользователь писал боту.")
 		console.error("Failed to send admin media copy:", error)
 	}
@@ -7170,7 +7890,7 @@ const enqueueTranslateJob = async (
 	externalAudioUrl?: string,
 	replyToMessageId?: number,
 ) => {
-	const sourceUrl = normalizeVimeoUrl(rawUrl)
+	const sourceUrl = normalizeFacebookCdnVideoUrl(normalizeVimeoUrl(rawUrl))
 	void logUserLink(userId, sourceUrl, "requested")
 
 	const lockResult = lockUserUrl(userId, sourceUrl)
@@ -7241,7 +7961,7 @@ const enqueueTaskJob = async (
 	options: { translate: boolean; sponsor: boolean; sponsorCategories?: string[] },
 	replyToMessageId?: number,
 ) => {
-	const sourceUrl = normalizeVimeoUrl(rawUrl)
+	const sourceUrl = normalizeFacebookCdnVideoUrl(normalizeVimeoUrl(rawUrl))
 	let sponsorCutRequested = options.sponsor
 	let sponsorCategories = options.sponsorCategories
 	if (sponsorCutRequested && !isYouTubeUrl(sourceUrl)) {
@@ -7453,7 +8173,7 @@ bot.on("message:text", async (ctx, next) => {
 			await ctx.reply("Invalid URL.")
 			return
 		}
-		const sourceUrl = normalizeVimeoUrl(rawUrl)
+		const sourceUrl = normalizeFacebookCdnVideoUrl(normalizeVimeoUrl(rawUrl))
 		void logUserLink(userId, sourceUrl, "requested")
 
 		const lockResult = lockUserUrl(userId, sourceUrl)
@@ -7466,8 +8186,39 @@ bot.on("message:text", async (ctx, next) => {
 		let keepLock = false
 		const processing = await ctx.reply("Получаем форматы...")
 		try {
-			let downloadUrl = normalizeVimeoUrl(rawUrl)
+			let downloadUrl = normalizeFacebookCdnVideoUrl(normalizeVimeoUrl(rawUrl))
 			let bypassTitle: string | undefined
+			let expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(sourceUrl)
+			const isFacebookShareReelSource = facebookShareReelMatcher(sourceUrl)
+			const resolvedFacebookUrl = await resolveFacebookShareUrl(downloadUrl)
+			if (resolvedFacebookUrl !== downloadUrl) {
+				console.log(
+					`[DEBUG] Resolved Facebook share URL: ${downloadUrl} -> ${resolvedFacebookUrl}`,
+				)
+				downloadUrl = resolvedFacebookUrl
+			}
+			if (!expectedFacebookStoryFbid) {
+				expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(downloadUrl)
+			}
+			if (facebookStoryMatcher(downloadUrl) || facebookShareReelMatcher(downloadUrl)) {
+				const storyData = await resolveFacebookStory(downloadUrl)
+				if (storyData.video_url) {
+					downloadUrl = normalizeFacebookCdnVideoUrl(storyData.video_url)
+					bypassTitle = storyData.title || "Facebook Story"
+				} else if (storyData.error) {
+					console.error("Facebook story error:", storyData.error)
+					if (isFacebookTemporaryBlockError(storyData.error)) {
+						throw new Error(getFacebookTemporaryBlockMessage())
+					}
+					// share/r links are often unstable for HTML parsing; let yt-dlp handle them as fallback
+					if (facebookStoryMatcher(downloadUrl) && !isFacebookShareReelSource) {
+						throw new Error(`Facebook story resolve failed: ${storyData.error}`)
+					}
+					console.warn(
+						`[WARN] Facebook share/reel bypass failed, fallback to yt-dlp: ${storyData.error}`,
+					)
+				}
+			}
 			const isThreads = threadsMatcher(downloadUrl)
 			if (isThreads) {
 				const threadsUsername = getThreadsUsername(sourceUrl)
@@ -7607,6 +8358,17 @@ bot.on("message:text", async (ctx, next) => {
 						: new Error("No valid info")
 				}
 				const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+			if (expectedFacebookStoryFbid && typeof info?.webpage_url === "string") {
+				const actualFacebookStoryFbid = extractFacebookStoryFbid(info.webpage_url)
+				if (
+					actualFacebookStoryFbid &&
+					actualFacebookStoryFbid !== expectedFacebookStoryFbid
+				) {
+					throw new Error(
+						`Facebook story mismatch: expected story_fbid=${expectedFacebookStoryFbid}, got story_fbid=${actualFacebookStoryFbid}`,
+					)
+				}
+			}
 
 			if (!info.formats || info.formats.length === 0) {
 				await ctx.reply("No formats found.")
@@ -7660,7 +8422,11 @@ bot.on("message:text", async (ctx, next) => {
 				context: "formats",
 				error: error instanceof Error ? error.message : String(error),
 			})
-			await ctx.reply("Ошибка.")
+			await ctx.reply(
+				isFacebookTemporaryBlockError(error)
+					? getFacebookTemporaryBlockMessage()
+					: "Ошибка.",
+			)
 		} finally {
 			if (!keepLock) {
 				unlockUserUrl(userId, sourceUrl, lockId)
@@ -7782,7 +8548,21 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 	console.log(`[DEBUG] Processing URL from ${ctx.chat.id}: ${url.text}`)
 	url.text = normalizeVimeoUrl(url.text)
+	url.text = normalizeFacebookCdnVideoUrl(url.text)
 	const sourceUrl = url.text
+	let expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(sourceUrl)
+	if (!isFacebookCdnVideoUrl(url.text)) {
+		const resolvedFacebookUrl = await resolveFacebookShareUrl(url.text)
+		if (resolvedFacebookUrl !== url.text) {
+			console.log(
+				`[DEBUG] Resolved Facebook share URL: ${url.text} -> ${resolvedFacebookUrl}`,
+			)
+			url.text = resolvedFacebookUrl
+		}
+	}
+	if (!expectedFacebookStoryFbid) {
+		expectedFacebookStoryFbid = extractFacebookExpectedStoryFbid(url.text)
+	}
 
 	const threadId = ctx.message.message_thread_id
 	let processingMessage: any
@@ -7909,6 +8689,27 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 			url.text = resolvedTiktokUrl
 		}
 		let bypassTitle: string | undefined
+		const isFacebookShareReelSource = facebookShareReelMatcher(sourceUrl)
+
+		if (facebookStoryMatcher(url.text) || facebookShareReelMatcher(url.text)) {
+			const storyData = await resolveFacebookStory(url.text)
+			if (storyData.video_url) {
+				url.text = normalizeFacebookCdnVideoUrl(storyData.video_url)
+				bypassTitle = storyData.title || "Facebook Story"
+			} else if (storyData.error) {
+				console.error("Facebook story error:", storyData.error)
+				if (isFacebookTemporaryBlockError(storyData.error)) {
+					throw new Error(getFacebookTemporaryBlockMessage())
+				}
+				// share/r links are often unstable for HTML parsing; let yt-dlp handle them as fallback
+				if (facebookStoryMatcher(url.text) && !isFacebookShareReelSource) {
+					throw new Error(`Facebook story resolve failed: ${storyData.error}`)
+				}
+				console.warn(
+					`[WARN] Facebook share/reel bypass failed, fallback to yt-dlp: ${storyData.error}`,
+				)
+			}
+		}
 
 		const isSora = soraMatcher(url.text)
 		if (isSora) {
@@ -8129,6 +8930,17 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 				: new Error("No valid info")
 		}
 		const info = await withRateLimitRetry(fetchInfoOnce, isVimeo)
+		if (expectedFacebookStoryFbid && typeof info?.webpage_url === "string") {
+			const actualFacebookStoryFbid = extractFacebookStoryFbid(info.webpage_url)
+			if (
+				actualFacebookStoryFbid &&
+				actualFacebookStoryFbid !== expectedFacebookStoryFbid
+			) {
+				throw new Error(
+					`Facebook story mismatch: expected story_fbid=${expectedFacebookStoryFbid}, got story_fbid=${actualFacebookStoryFbid}`,
+				)
+			}
+		}
 
 		const resolvedTitle = resolveTitle(info, isTiktok)
 			const title =
@@ -8842,10 +9654,32 @@ bot.on("callback_query:data", async (ctx) => {
 		selectedFormat.acodec !== "none"
 	const userId = ctx.from?.id
 	if (!userId) return
+	if (cached.userId && cached.userId !== userId) {
+		await ctx.answerCallbackQuery({
+			text: "Это меню не для вас.",
+			show_alert: true,
+		})
+		return
+	}
+	let effectiveLockId = cached.lockId
+	if (!effectiveLockId) {
+		const newLock = lockUserUrl(userId, getCacheLockUrl(cached))
+		if (!newLock.ok) {
+			await ctx.answerCallbackQuery({
+				text: "Эта ссылка уже в обработке. Дождитесь завершения.",
+				show_alert: true,
+			})
+			return
+		}
+		effectiveLockId = newLock.lockId
+		cached.lockId = effectiveLockId
+		cached.userId = userId
+		requestCache.set(requestId, cached)
+	}
 	const blockReason = getQueueBlockReason(
 		userId,
 		getCacheLockUrl(cached),
-		cached.lockId,
+		effectiveLockId,
 	)
 	if (blockReason) {
 		await ctx.answerCallbackQuery({ text: blockReason, show_alert: true })
@@ -8855,12 +9689,12 @@ bot.on("callback_query:data", async (ctx) => {
 	await ctx.editMessageText(
 		`Скачиваем ${quality === "b" ? "Лучшее" : quality}...`,
 	)
-	if (!cached.lockId) {
+	if (!effectiveLockId) {
 		await ctx.answerCallbackQuery({ text: "Request expired or invalid.", show_alert: true })
 		return
 	}
 	requestCache.delete(requestId)
-	enqueueJob(userId, url, cached.lockId, async (signal) => {
+	enqueueJob(userId, url, effectiveLockId, async (signal) => {
 		await downloadAndSend(
 			ctx,
 			url,

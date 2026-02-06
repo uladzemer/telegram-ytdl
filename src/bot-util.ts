@@ -39,6 +39,26 @@ const formatUserIdLink = (user?: UserLike) => {
 	return `<a href="tg://user?id=${user.id}">${user.id}</a>`
 }
 
+const splitContextUrl = (context?: string) => {
+	if (!context) return {}
+	const lines = context.split(/\r?\n/)
+	const rest: string[] = []
+	let url: string | undefined
+	for (const line of lines) {
+		const match = line.match(/^URL:\s*(.+)\s*$/i)
+		if (match?.[1]) {
+			url = match[1].trim()
+			continue
+		}
+		rest.push(line)
+	}
+	const cleanedRest = rest.join("\n").trim()
+	return {
+		url,
+		rest: cleanedRest || undefined,
+	}
+}
+
 export const deleteMessage = (message: Message) => {
 	return bot.api
 		.deleteMessage(message.chat.id, message.message_id)
@@ -61,8 +81,10 @@ export const errorMessage = (
 		bot.api.sendMessage(chat.id, messageText, { parse_mode: "HTML" }),
 	]
 
-	const userIdLabel = user?.id ? ` (id: ${user.id})` : ""
-	let adminMessage = `Ошибка в чате ${formatUserMention(user, chat)}${userIdLabel}`
+	let adminMessage = `Ошибка в чате ${formatUserMention(user, chat)}`
+	if (user?.id) {
+		adminMessage += `\nID: ${code(String(user.id))}`
+	}
 	if (error) adminMessage += `\n\n${code(cutoffWithNotice(error))}`
 
 	console.error("Error in chat", chat.id, error)
@@ -103,9 +125,15 @@ export const notifyAdminError = (
 	user?: UserLike,
 	originalMessage?: MessageLike,
 ) => {
-	const userIdLabel = user?.id ? ` (id: ${user.id})` : ""
-	let adminMessage = `Ошибка в чате ${formatUserMention(user, chat)}${userIdLabel}`
-	if (context) adminMessage += `\n\n${code(cutoffWithNotice(context))}`
+	let adminMessage = `Ошибка в чате ${formatUserMention(user, chat)}`
+	if (user?.id) {
+		adminMessage += `\nID: ${code(String(user.id))}`
+	}
+	if (context) {
+		const { url, rest } = splitContextUrl(context)
+		if (rest) adminMessage += `\n\n${code(cutoffWithNotice(rest))}`
+		if (url) adminMessage += `\n\n${code(cutoffWithNotice(url))}`
+	}
 	if (error) adminMessage += `\n\n${code(cutoffWithNotice(error))}`
 	const keyboard =
 		user?.id && user.id !== ADMIN_ID

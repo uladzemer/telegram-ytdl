@@ -3801,6 +3801,29 @@ const runTelegramSendWithRetry = async <T>(
 		: new Error(`${action} failed after retries`)
 }
 
+const runWithPersistentChatAction = async <T>(
+	ctx: any,
+	chatAction: "upload_video" | "upload_document" | "upload_audio" | "upload_voice",
+	send: () => Promise<T>,
+	intervalMs = 4500,
+) => {
+	const pulse = async () => {
+		try {
+			await ctx.replyWithChatAction(chatAction)
+		} catch {}
+	}
+	await pulse()
+	const timer = setInterval(() => {
+		void pulse()
+	}, intervalMs)
+	timer.unref?.()
+	try {
+		return await send()
+	} finally {
+		clearInterval(timer)
+	}
+}
+
 const formatUserIdLinkHtml = (userId: number) =>
 	`<a href="tg://user?id=${userId}">${userId}</a>`
 
@@ -4108,17 +4131,18 @@ const downloadAndSend = async (
 					`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 				)
 			}
-			await ctx.replyWithChatAction("upload_video")
-			await ctx.replyWithVideo(new InputFile(tempFilePath), {
-				caption,
-				parse_mode: "HTML",
-				supports_streaming: true,
-				duration: metadata.duration,
-				width: metadata.width,
-				height: metadata.height,
-				thumbnail: thumbFile,
-				message_thread_id: threadId,
-			})
+				await runWithPersistentChatAction(ctx, "upload_video", () =>
+					ctx.replyWithVideo(new InputFile(tempFilePath), {
+						caption,
+						parse_mode: "HTML",
+						supports_streaming: true,
+						duration: metadata.duration,
+						width: metadata.width,
+						height: metadata.height,
+						thumbnail: thumbFile,
+						message_thread_id: threadId,
+					}),
+				)
 			if (statusMessageId) {
 				try {
 					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
@@ -5609,16 +5633,17 @@ const downloadAndSend = async (
 						`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 					)
 					}
-					await ctx.replyWithChatAction("upload_document")
-					await runTelegramSendWithRetry("sendDocument", () =>
-						ctx.replyWithDocument(new InputFile(tempFilePath), {
-							caption,
-							parse_mode: "HTML",
-							message_thread_id: threadId,
-						}),
-					)
-				} else {
-					if (outputContainer !== "mp4") {
+						await runWithPersistentChatAction(ctx, "upload_document", () =>
+							runTelegramSendWithRetry("sendDocument", () =>
+								ctx.replyWithDocument(new InputFile(tempFilePath), {
+									caption,
+									parse_mode: "HTML",
+									message_thread_id: threadId,
+								}),
+							),
+						)
+					} else {
+						if (outputContainer !== "mp4") {
 					if (statusMessageId) {
 						await updateMessage(
 							ctx,
@@ -5626,15 +5651,16 @@ const downloadAndSend = async (
 							`Обработка: <b>${title}</b>\nСтатус: Отправляем...`,
 						)
 						}
-						await ctx.replyWithChatAction("upload_document")
-						await runTelegramSendWithRetry("sendDocument", () =>
-							ctx.replyWithDocument(new InputFile(tempFilePath), {
-								caption,
-								parse_mode: "HTML",
-								message_thread_id: threadId,
-							}),
-						)
-					} else {
+							await runWithPersistentChatAction(ctx, "upload_document", () =>
+								runTelegramSendWithRetry("sendDocument", () =>
+									ctx.replyWithDocument(new InputFile(tempFilePath), {
+										caption,
+										parse_mode: "HTML",
+										message_thread_id: threadId,
+									}),
+								),
+							)
+						} else {
 					// Get metadata directly from the file
 					const metadata = await getVideoMetadata(tempFilePath)
 					const width = metadata.width || info.width
@@ -5661,25 +5687,26 @@ const downloadAndSend = async (
 						)
 					}
 
-						await ctx.replyWithChatAction("upload_video")
-						const supportsStreaming =
-							outputContainer === "mp4" && !isTiktok && !isAv1Video
-						try {
-							await runTelegramSendWithRetry("sendVideo", () =>
-								ctx.replyWithVideo(new InputFile(tempFilePath), {
-									caption,
-									parse_mode: "HTML",
-									supports_streaming: supportsStreaming,
-									duration,
-									width,
-									height,
-									thumbnail: hasThumbFile
-										? new InputFile(tempThumbPath)
-										: undefined,
-									message_thread_id: threadId,
-								}),
-							)
-						} catch (sendVideoError) {
+							const supportsStreaming =
+								outputContainer === "mp4" && !isTiktok && !isAv1Video
+							try {
+								await runWithPersistentChatAction(ctx, "upload_video", () =>
+									runTelegramSendWithRetry("sendVideo", () =>
+										ctx.replyWithVideo(new InputFile(tempFilePath), {
+											caption,
+											parse_mode: "HTML",
+											supports_streaming: supportsStreaming,
+											duration,
+											width,
+											height,
+											thumbnail: hasThumbFile
+												? new InputFile(tempThumbPath)
+												: undefined,
+											message_thread_id: threadId,
+										}),
+									),
+								)
+							} catch (sendVideoError) {
 						console.warn("[WARN] sendVideo failed, retrying as document", {
 							url: cleanUrl(sourceUrl || url),
 							error:
@@ -5694,16 +5721,17 @@ const downloadAndSend = async (
 								`Обработка: <b>${title}</b>\nСтатус: Видео не отправилось, пробуем как файл...`,
 							)
 						}
-						await ctx.replyWithChatAction("upload_document")
-						await runTelegramSendWithRetry("sendDocument", () =>
-							ctx.replyWithDocument(new InputFile(tempFilePath), {
-								caption,
-								parse_mode: "HTML",
-								message_thread_id: threadId,
-							}),
-						)
+							await runWithPersistentChatAction(ctx, "upload_document", () =>
+								runTelegramSendWithRetry("sendDocument", () =>
+									ctx.replyWithDocument(new InputFile(tempFilePath), {
+										caption,
+										parse_mode: "HTML",
+										message_thread_id: threadId,
+									}),
+								),
+							)
+						}
 					}
-				}
 			}
 
 			if (statusMessageId) {

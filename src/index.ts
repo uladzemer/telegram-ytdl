@@ -248,9 +248,37 @@ const execFilePromise = (
 	})
 }
 
+const statusMessageRedirects = new Map<number, number>()
+
+const resolveStatusMessageId = (messageId: number) => {
+	let current = messageId
+	const visited = new Set<number>()
+	while (statusMessageRedirects.has(current) && !visited.has(current)) {
+		visited.add(current)
+		const next = statusMessageRedirects.get(current)
+		if (!next || next === current) break
+		current = next
+	}
+	return current
+}
+
+const deleteStatusMessage = async (ctx: any, messageId?: number) => {
+	if (!messageId) return
+	const resolvedId = resolveStatusMessageId(messageId)
+	try {
+		await ctx.api.deleteMessage(ctx.chat.id, resolvedId)
+	} catch {}
+	if (resolvedId !== messageId) {
+		try {
+			await ctx.api.deleteMessage(ctx.chat.id, messageId)
+		} catch {}
+	}
+	statusMessageRedirects.delete(messageId)
+	statusMessageRedirects.delete(resolvedId)
+}
+
 const updateMessage = (() => {
 	const lastUpdates = new Map<number, number>()
-	const redirects = new Map<number, number>()
 	return async (
 		ctx: any,
 		messageId: number,
@@ -258,7 +286,7 @@ const updateMessage = (() => {
 		options?: { force?: boolean },
 	) => {
 		const force = options?.force === true
-		const resolvedId = redirects.get(messageId) ?? messageId
+		const resolvedId = resolveStatusMessageId(messageId)
 		const now = Date.now()
 		const last = lastUpdates.get(resolvedId) || 0
 		if (!force && now - last < 1500) return
@@ -288,10 +316,12 @@ const updateMessage = (() => {
 						ctx.callbackQuery?.message?.message_thread_id
 					const sent = await ctx.reply(text, {
 						message_thread_id: threadId,
+						parse_mode: "HTML",
+						disable_notification: true,
 					})
 					if (sent?.message_id) {
-						redirects.set(messageId, sent.message_id)
-						redirects.set(sent.message_id, sent.message_id)
+						statusMessageRedirects.set(messageId, sent.message_id)
+						statusMessageRedirects.set(sent.message_id, sent.message_id)
 						lastUpdates.set(sent.message_id, now)
 					}
 				} catch {}
@@ -310,12 +340,14 @@ const sendStatusMessage = async (
 		return await ctx.reply(text, {
 			reply_to_message_id: replyToMessageId,
 			message_thread_id: threadId,
+			disable_notification: true,
 		})
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error)
 		if (message.includes("message to be replied not found")) {
 			return await ctx.reply(text, {
 				message_thread_id: threadId,
+				disable_notification: true,
 			})
 		}
 		throw error
@@ -2156,6 +2188,9 @@ const facebookShareReelMatcher = (url: string) => {
 	}
 }
 
+const isFacebookUrl = (url: string) =>
+	urlMatcher(url, "facebook.com") || urlMatcher(url, "fb.watch")
+
 const unwrapFacebookRedirectUrl = (url: string) => {
 	try {
 		const parsed = new URL(url)
@@ -2838,7 +2873,7 @@ const isAuthError = (error: unknown) => {
 
 const isFacebookTemporaryBlockError = (error: unknown) => {
 	const message = error instanceof Error ? error.message : String(error)
-	return /facebook temporarily blocked|you have been temporarily blocked|you used this feature too often|вы временно заблокированы|слишком часто использовали эту функцию|\[facebook\].*cannot parse data/i.test(
+	return /facebook temporarily blocked|you have been temporarily blocked|you used this feature too often|вы временно заблокированы|слишком часто использовали эту функцию|\[facebook\].*cannot parse data|facebook\.com\/privacy\/consent|flow=ad_free_subscription|unsupported url:\s*https?:\/\/(?:www\.)?facebook\.com\/privacy\/consent/i.test(
 		message,
 	)
 }
@@ -3979,6 +4014,7 @@ const downloadAndSend = async (
 			urlMatcher(url, "instagram.com") || urlMatcher(url, "instagr.am")
 		const isErome = urlMatcher(url, "erome.com")
 		const isVimeo = isVimeoUrl(url)
+		const isFacebook = isFacebookUrl(url)
 		const isPornoxo = pornoxoMatcher(url)
 		const isDirectHls = /\.m3u8(\?|$)/i.test(url)
 		let forceHlsDownload = selectedForceHls || isDirectHls
@@ -3987,7 +4023,7 @@ const downloadAndSend = async (
 		const isYouTube = isYouTubeUrl(url)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
+		const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",
@@ -4038,6 +4074,14 @@ const downloadAndSend = async (
 				reply_to_message_id: replyToMessageId,
 				supports_streaming: true,
 			})
+			if (statusMessageId) {
+				await deleteStatusMessage(ctx, statusMessageId)
+			}
+			if (replyToMessageId) {
+				try {
+					await ctx.api.deleteMessage(ctx.chat.id, replyToMessageId)
+				} catch {}
+			}
 			return
 		}
 
@@ -4058,9 +4102,7 @@ const downloadAndSend = async (
 			)
 			if (entries.length > 1) {
 				if (statusMessageId) {
-					try {
-						await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
-					} catch {}
+					await deleteStatusMessage(ctx, statusMessageId)
 				}
 				for (const [index, entry] of entries.entries()) {
 					if (signal?.aborted) return
@@ -4144,9 +4186,7 @@ const downloadAndSend = async (
 					}),
 				)
 			if (statusMessageId) {
-				try {
-					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
-				} catch {}
+				await deleteStatusMessage(ctx, statusMessageId)
 			}
 			if (replyToMessageId) {
 				try {
@@ -4789,9 +4829,7 @@ const downloadAndSend = async (
 				message_thread_id: threadId,
 			})
 			if (statusMessageId) {
-				try {
-					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
-				} catch {}
+				await deleteStatusMessage(ctx, statusMessageId)
 			}
 			if (replyToMessageId) {
 				try {
@@ -5735,9 +5773,7 @@ const downloadAndSend = async (
 			}
 
 			if (statusMessageId) {
-				try {
-					await ctx.api.deleteMessage(ctx.chat.id, statusMessageId)
-				} catch {}
+				await deleteStatusMessage(ctx, statusMessageId)
 			}
 
 			if (replyToMessageId) {
@@ -7998,7 +8034,9 @@ bot.on("message:document", async (ctx) => {
 		return
 	}
 
-	const processing = await ctx.reply("Обновляем cookies...")
+	const processing = await ctx.reply("Обновляем cookies...", {
+		disable_notification: true,
+	})
 	try {
 		const file = await ctx.api.getFile(doc.file_id)
 		if (!file.file_path) {
@@ -8137,7 +8175,9 @@ const enqueueTranslateJob = async (
 	}
 	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
-	const processing = await ctx.reply("Ставим перевод в очередь...")
+	const processing = await ctx.reply("Ставим перевод в очередь...", {
+		disable_notification: true,
+	})
 		enqueueJob(userId, sourceUrl, lockId, async (signal) => {
 			try {
 				await runTranslatedDownload({
@@ -8217,7 +8257,9 @@ const enqueueTaskJob = async (
 	}
 	void incrementUserCounter(userId, "requests")
 	const lockId = lockResult.lockId
-	const processing = await ctx.reply("Ставим задачу в очередь...")
+	const processing = await ctx.reply("Ставим задачу в очередь...", {
+		disable_notification: true,
+	})
 	scheduleDeleteMessage(processing)
 	enqueueJob(userId, sourceUrl, lockId, async (signal) => {
 		if (options.translate) {
@@ -8421,7 +8463,9 @@ bot.on("message:text", async (ctx, next) => {
 		void incrementUserCounter(userId, "requests")
 		const lockId = lockResult.lockId
 		let keepLock = false
-		const processing = await ctx.reply("Получаем форматы...")
+		const processing = await ctx.reply("Получаем форматы...", {
+			disable_notification: true,
+		})
 		try {
 			let downloadUrl = normalizeFacebookCdnVideoUrl(normalizeVimeoUrl(rawUrl))
 			let bypassTitle: string | undefined
@@ -8536,8 +8580,9 @@ bot.on("message:text", async (ctx, next) => {
 				const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
 				const isTiktok = urlMatcher(downloadUrl, "tiktok.com")
 				const isVimeo = isVimeoUrl(downloadUrl)
+				const isFacebook = isFacebookUrl(downloadUrl)
 				const additionalArgs = isTiktok ? tiktokArgs : []
-				const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
+				const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
 				const vimeoArgs = isVimeo
 					? [
 							"--sleep-requests",
@@ -9096,12 +9141,13 @@ bot.on("message:text").on("::url", async (ctx, next) => {
 
 		const isTiktok = urlMatcher(url.text, "tiktok.com")
 		const isVimeo = isVimeoUrl(url.text)
+		const isFacebook = isFacebookUrl(url.text)
 		const useCobalt = cobaltMatcher(url.text)
 		const additionalArgs = isTiktok ? tiktokArgs : []
 		const isYouTube = isYouTubeUrl(url.text)
 		const cookieArgsList = await cookieArgs()
 		const youtubeArgs = isYouTube ? youtubeExtractorArgs : []
-		const proxyArgs = isVimeo || isPornoxo ? [] : await getProxyArgs()
+		const proxyArgs = isVimeo || isPornoxo || isFacebook ? [] : await getProxyArgs()
 		const vimeoArgs = isVimeo
 			? [
 					"--sleep-requests",
@@ -9561,7 +9607,9 @@ bot.on("callback_query:data", async (ctx) => {
 		}
 		requestCache.delete(requestId)
 		await deletePreviousMenuMessage(ctx)
-		const processing = await ctx.reply("Ставим перевод в очередь...")
+		const processing = await ctx.reply("Ставим перевод в очередь...", {
+			disable_notification: true,
+		})
 			enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
 				try {
 					await runTranslatedDownload({
@@ -9688,7 +9736,9 @@ bot.on("callback_query:data", async (ctx) => {
 			}
 			requestCache.delete(requestId)
 			await deletePreviousMenuMessage(ctx)
-			const processing = await ctx.reply("Ставим в очередь MP3...")
+			const processing = await ctx.reply("Ставим в очередь MP3...", {
+				disable_notification: true,
+			})
 			enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
 				await downloadAndSend(
 					ctx,
@@ -9822,6 +9872,9 @@ bot.on("callback_query:data", async (ctx) => {
 		await deletePreviousMenuMessage(ctx)
 		const processing = await ctx.reply(
 			`Ставим в очередь формат: ${formatString}...`,
+			{
+				disable_notification: true,
+			},
 		)
 		enqueueJob(userId, getCacheLockUrl(cached), cached.lockId, async (signal) => {
 			await downloadAndSend(

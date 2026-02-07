@@ -171,6 +171,24 @@ def should_refetch_resolved_url(value):
         return False
 
 
+def is_facebook_consent_url(value):
+    if not value:
+        return False
+    try:
+        parsed = urlsplit(value)
+        host = parsed.netloc.lower()
+        if not host.endswith("facebook.com"):
+            return False
+        path = parsed.path.lower()
+        if path.startswith("/privacy/consent"):
+            return True
+        query = parse_qs(parsed.query)
+        flow = (query.get("flow") or [None])[0]
+        return isinstance(flow, str) and "ad_free_subscription" in flow.lower()
+    except Exception:
+        return False
+
+
 def is_temporary_block_page(text):
     if not text:
         return False
@@ -263,6 +281,46 @@ def pick_best_story_url(candidates):
     return max(candidates, key=score)
 
 
+def to_mbasic_url(value):
+    if not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+        host = parsed.netloc.lower()
+        if not host.endswith("facebook.com"):
+            return value
+        return urlunsplit(
+            (
+                parsed.scheme or "https",
+                "mbasic.facebook.com",
+                parsed.path,
+                parsed.query,
+                parsed.fragment,
+            )
+        )
+    except Exception:
+        return value
+
+
+def extract_video_redirect_src(text):
+    if not text:
+        return None
+    # /video_redirect/?src=<encoded_video_url>
+    for match in re.findall(r'href=["\']([^"\']*?/video_redirect/\?[^"\']+)["\']', text, re.IGNORECASE):
+        candidate = clean_url(match)
+        if candidate.startswith("/"):
+            candidate = f"https://mbasic.facebook.com{candidate}"
+        try:
+            parsed = urlsplit(candidate)
+            query = parse_qs(parsed.query)
+            src = (query.get("src") or [None])[0]
+            if isinstance(src, str) and src.startswith("http"):
+                return clean_url(src)
+        except Exception:
+            continue
+    return None
+
+
 def resolve_story(url, cookie_file=None, proxy_file=None):
     headers = [
         ("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
@@ -335,25 +393,81 @@ def resolve_story(url, cookie_file=None, proxy_file=None):
             return target_url
         return clean_url(resolved)
 
+    def try_mbasic_fallback(target_url):
+        mbasic_url = to_mbasic_url(target_url)
+        text_mbasic, fallback_error = fetch_page(mbasic_url)
+        if fallback_error or not text_mbasic:
+            return None
+
+        src_candidate = extract_video_redirect_src(text_mbasic)
+        if src_candidate:
+            return {"video_url": strip_byte_range(src_candidate), "title": "Facebook Story"}
+
+        keys = [
+            "playable_url_quality_hd",
+            "browser_native_hd_url",
+            "playable_url_quality_sd",
+            "browser_native_sd_url",
+            "playable_url",
+            "playback_url",
+            "video_url",
+        ]
+        json_candidate = first_json_url(text_mbasic, keys)
+        if json_candidate:
+            return {"video_url": strip_byte_range(json_candidate), "title": "Facebook Story"}
+
+        mp4_urls = [u for u in extract_mp4_urls(text_mbasic) if "fbcdn.net" in u]
+        picked = pick_best_story_url(mp4_urls) or pick_best_url(mp4_urls)
+        if picked:
+            return {"video_url": strip_byte_range(picked), "title": "Facebook Story"}
+
+        return None
+
     initial_url = resolve_effective_url(url)
+    if is_facebook_consent_url(initial_url):
+        mbasic_result = try_mbasic_fallback(url)
+        if mbasic_result:
+            return mbasic_result
+        return {
+            "error": "Facebook temporarily blocked this action for the current account/IP. Please wait and retry."
+        }
     if should_refetch_resolved_url(initial_url):
         url = initial_url
 
     text, error = fetch_page(url)
     if error:
+        mbasic_result = try_mbasic_fallback(url)
+        if mbasic_result:
+            return mbasic_result
         return error
     if is_temporary_block_page(text):
+        mbasic_result = try_mbasic_fallback(url)
+        if mbasic_result:
+            return mbasic_result
         return {
             "error": "Facebook temporarily blocked this action for the current account/IP. Please wait and retry."
         }
 
     meta_url = extract_meta_url(text)
+    if is_facebook_consent_url(meta_url):
+        mbasic_result = try_mbasic_fallback(url)
+        if mbasic_result:
+            return mbasic_result
+        return {
+            "error": "Facebook temporarily blocked this action for the current account/IP. Please wait and retry."
+        }
     if should_refetch_resolved_url(meta_url) and clean_url(meta_url) != clean_url(url):
         url = clean_url(meta_url)
         text, error = fetch_page(url)
         if error:
+            mbasic_result = try_mbasic_fallback(url)
+            if mbasic_result:
+                return mbasic_result
             return error
         if is_temporary_block_page(text):
+            mbasic_result = try_mbasic_fallback(url)
+            if mbasic_result:
+                return mbasic_result
             return {
                 "error": "Facebook temporarily blocked this action for the current account/IP. Please wait and retry."
             }
@@ -369,8 +483,14 @@ def resolve_story(url, cookie_file=None, proxy_file=None):
         if story_url:
             text, error = fetch_page(story_url)
             if error:
+                mbasic_result = try_mbasic_fallback(story_url)
+                if mbasic_result:
+                    return mbasic_result
                 return error
             if is_temporary_block_page(text):
+                mbasic_result = try_mbasic_fallback(story_url)
+                if mbasic_result:
+                    return mbasic_result
                 return {
                     "error": "Facebook temporarily blocked this action for the current account/IP. Please wait and retry."
                 }

@@ -56,6 +56,11 @@ import {
 	VOT_LIVELY_VOICE,
 	VOT_OAUTH_TOKEN,
 	VOT_MAX_WAIT_SECONDS,
+	FACECONTROL_ENABLED,
+	FACECONTROL_MAX_USER_ID,
+	FACECONTROL_AUTO_APPROVE_JOIN,
+	FACECONTROL_WHITELIST_IDS,
+	FACECONTROL_BLOCK_MESSAGE,
 } from "./environment"
 import { getThumbnail, urlMatcher, getVideoMetadata, generateThumbnail } from "./media-util"
 import { Queue } from "./queue"
@@ -862,6 +867,23 @@ const isBanned = async (userId: number) => {
 	await loadBans()
 	return bans.has(userId)
 }
+
+const isFaceControlWhitelisted = (userId: number) => {
+	if (userId === ADMIN_ID) return true
+	return FACECONTROL_WHITELIST_IDS.includes(userId)
+}
+
+const isFaceControlBlocked = (userId: number) => {
+	if (!FACECONTROL_ENABLED) return false
+	if (!Number.isFinite(FACECONTROL_MAX_USER_ID) || FACECONTROL_MAX_USER_ID <= 0) {
+		return false
+	}
+	if (isFaceControlWhitelisted(userId)) return false
+	return userId > FACECONTROL_MAX_USER_ID
+}
+
+const getFaceControlBlockReason = () =>
+	`${FACECONTROL_BLOCK_MESSAGE}\n(ID limit: <= ${FACECONTROL_MAX_USER_ID})`
 
 const parseCookieStats = (content: string) => {
 	const lines = content.split(/\r?\n/)
@@ -5919,6 +5941,12 @@ const runTranslatedDownload = async (params: {
 bot.use(async (ctx, next) => {
 	const from = ctx.from
 	if (from?.id) {
+		if (isFaceControlBlocked(from.id)) {
+			if (ctx.chat?.type === "private") {
+				await ctx.reply(getFaceControlBlockReason())
+			}
+			return
+		}
 		await loadUsers()
 		const existing = users.get(from.id) || { id: from.id }
 		const updated: UserProfile = {
@@ -8797,6 +8825,27 @@ bot.on("my_chat_member", async (ctx) => {
 			`<b>Hello!</b> I'm ready to download videos here.\n\n` +
 				`I work in <b>Silent Mode</b>: just send a link (TikTok, YouTube, Instagram, etc.), and I'll reply with the video. No commands needed!`,
 		)
+	}
+})
+
+bot.on("chat_join_request", async (ctx) => {
+	const userId = ctx.from?.id
+	if (!userId) return
+
+	if (isFaceControlBlocked(userId)) {
+		try {
+			await ctx.api.declineChatJoinRequest(ctx.chat.id, userId)
+		} catch (error) {
+			console.error("Failed to decline join request (face-control):", error)
+		}
+		return
+	}
+
+	if (!FACECONTROL_AUTO_APPROVE_JOIN) return
+	try {
+		await ctx.api.approveChatJoinRequest(ctx.chat.id, userId)
+	} catch (error) {
+		console.error("Failed to approve join request:", error)
 	}
 })
 

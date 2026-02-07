@@ -13,6 +13,12 @@ const getVariable = (key: string, defaultValue?: string) => {
 	throw new Error(`Environment variable ${key} is not set`)
 }
 
+const parseIdList = (raw: string) =>
+	raw
+		.split(",")
+		.map((id) => Number.parseInt(id.trim(), 10))
+		.filter((id) => !Number.isNaN(id))
+
 export const YTDL_AUTOUPDATE =
 	getVariable("YTDL_AUTOUPDATE", "true") !== "false"
 export const WEBHOOK_PORT = getVariable("TELEGRAM_WEBHOOK_PORT", "8443")
@@ -20,11 +26,22 @@ export const WEBHOOK_URL = getVariable("TELEGRAM_WEBHOOK_URL", "")
 export const API_ROOT = getVariable("TELEGRAM_API_ROOT")
 export const BOT_TOKEN = getVariable("TELEGRAM_BOT_TOKEN")
 export const ADMIN_ID = Number.parseInt(getVariable("ADMIN_ID"))
-export const WHITELISTED_IDS = getVariable("WHITELISTED_IDS", "")
-	.split(",")
-	.map((id) => Number.parseInt(id))
-	.filter((id) => !Number.isNaN(id))
+export const WHITELISTED_IDS = parseIdList(getVariable("WHITELISTED_IDS", ""))
 export const ALLOW_GROUPS = getVariable("ALLOW_GROUPS", "true") !== "false"
+export const FACECONTROL_ENABLED = getVariable("FACECONTROL_ENABLED", "false") === "true"
+export const FACECONTROL_MAX_USER_ID = Number.parseInt(
+	getVariable("FACECONTROL_MAX_USER_ID", "0"),
+	10,
+)
+export const FACECONTROL_AUTO_APPROVE_JOIN =
+	getVariable("FACECONTROL_AUTO_APPROVE_JOIN", "false") === "true"
+export const FACECONTROL_WHITELIST_IDS = parseIdList(
+	getVariable("FACECONTROL_WHITELIST_IDS", ""),
+)
+export const FACECONTROL_BLOCK_MESSAGE = getVariable(
+	"FACECONTROL_BLOCK_MESSAGE",
+	"Фейс-контроль: доступ ограничен. Напишите администратору.",
+)
 export const OPENAI_API_KEY = getVariable("OPENAI_API_KEY", "")
 export const COBALT_INSTANCE_URL = getVariable("COBALT_INSTANCE_URL", "")
 export const YTDL_PROXY = getVariable("YTDL_PROXY", "")

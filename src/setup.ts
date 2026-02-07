@@ -129,7 +129,14 @@ if (ADMIN_ONLY) {
 	const httpServer = server.listen(webhookPort, () => {
 		void (async () => {
 			try {
-				await bot.api.setWebhook(WEBHOOK_URL)
+				await bot.api.setWebhook(WEBHOOK_URL, {
+					allowed_updates: [
+						"message",
+						"callback_query",
+						"my_chat_member",
+						"chat_join_request",
+					],
+				})
 				await setCommandsSafely()
 				console.log(`Webhook set to ${WEBHOOK_URL}`)
 				const me = await bot.api.getMe()
@@ -154,7 +161,7 @@ if (ADMIN_ONLY) {
 	startDashboardServer()
 	bot.start({
 		drop_pending_updates: true,
-		allowed_updates: ["message", "callback_query", "my_chat_member"],
+		allowed_updates: ["message", "callback_query", "my_chat_member", "chat_join_request"],
 		onStart: async (me) => {
 			try {
 				await setCommandsSafely()

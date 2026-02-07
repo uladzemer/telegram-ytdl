@@ -43,6 +43,11 @@ docker compose up -d
 | `YOUTUBE_POT_PROVIDER_URL` | Базовый URL PO‑token провайдера (например `http://bgutil-pot-provider:4416`)                                          |
 | `YOUTUBE_POT_DISABLE_INNERTUBE` | Отключить innertube у провайдера (`"true"`/`"false"`, опционально)                                               |
 | `OPENAI_API_KEY`        | Ключ OpenAI (опционально, авто‑переводы)                                                                                   |
+| `FACECONTROL_ENABLED`   | Включить фейс‑контроль по Telegram ID (`"true"`/`"false"`, по умолчанию `"false"`)                                      |
+| `FACECONTROL_MAX_USER_ID` | Максимальный Telegram ID для допуска (если `id` больше — блок)                                                           |
+| `FACECONTROL_WHITELIST_IDS` | Исключения для фейс‑контроля (ID через запятую)                                                                         |
+| `FACECONTROL_BLOCK_MESSAGE` | Текст сообщения при блокировке в личке                                                                                   |
+| `FACECONTROL_AUTO_APPROVE_JOIN` | Авто‑одобрение join request после проверки (`"true"`/`"false"`)                                                   |
 | `CLEANUP_INTERVAL_HOURS` | Интервал очистки временных файлов в /tmp (часы, по умолчанию 6)                                                            |
 | `CLEANUP_MAX_AGE_HOURS`  | Максимальный возраст временных файлов в /tmp (часы, по умолчанию 12)                                                       |
 
